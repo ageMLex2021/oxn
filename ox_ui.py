@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-OXH UI — minimal web interface for OX-Neuro Hyper (adaptive rate always on).
+OXH UI — minimal web interface for OX-Neuro Hyper.
 
 Run:    python3 ox_ui.py [--port 8000]
 Open:   http://127.0.0.1:8000
@@ -100,6 +100,9 @@ PAGE = r"""<!DOCTYPE html>
     <div class="row">
       <span style="color:var(--dim)">quality</span>
       <input type="number" id="q" value="100" min="1" max="100">
+      <label style="color:var(--dim)" title="Per-patch adaptive rate: меньше файлы, но заметно дольше">
+        <input type="checkbox" id="ad"> adaptive
+      </label>
       <button id="bc">Compress</button>
       <button id="bd" class="ghost">Decompress</button>
     </div>
@@ -212,6 +215,7 @@ async function run(op) {
       const fd = new FormData();
       fd.append('file', f);
       fd.append('q', $('q').value);
+      fd.append('adaptive', $('ad').checked ? '1' : '0');
       try {
         const r = await fetch('/api/' + op, { method: 'POST', body: fd });
         if (r.status === 415) {           // неподдерживаемый формат — молча
@@ -279,15 +283,17 @@ def do_compress(fields, files):
     if not os.path.exists(CKPT):
         raise RuntimeError('no ox_neuro.pt model — see README.md')
     q = fields.get('q', '100')
+    cmd = [sys.executable, OX_NEURO, 'c', None, None, '--q', q]
+    if fields.get('adaptive') == '1':
+        cmd.append('--adaptive')
     with tempfile.TemporaryDirectory(prefix='oxh_') as td:
         src = os.path.join(td, name)
         dst = src + '.oxh'
+        cmd[3], cmd[4] = src, dst
         with open(src, 'wb') as f:
             f.write(data)
         t0 = time.time()
-        r = subprocess.run([sys.executable, OX_NEURO, 'c', src, dst,
-                            '--q', q, '--adaptive'],
-                           capture_output=True, timeout=86400)
+        r = subprocess.run(cmd, capture_output=True, timeout=86400)
         if r.returncode != 0:
             raise RuntimeError(r.stderr.decode('utf-8', 'replace')[-400:])
         out = open(dst, 'rb').read()

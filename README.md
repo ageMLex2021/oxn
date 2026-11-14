@@ -94,7 +94,9 @@ python3 ox_ui.py --host 0.0.0.0       # LAN mode: other devices (Windows PC,
 
 Drag&drop images or whole folders onto the drop zone. Two actions only:
 **Compress** (images -> `.oxh`) and **Decompress** (`.oxh` -> `.jpg`).
-Quality slider 1..100 (100 = best). Adaptive per-patch rate is always on.
+Quality slider 1..100 (100 = best). The **adaptive** checkbox enables
+per-patch adaptive rate: noticeably smaller files, but much slower on huge
+images (the decoder runs once per rate candidate).
 After the first file finishes, the browser asks where to save; the rest of
 the queue goes to the same folder. Unsupported formats are skipped silently.
 GPU is used automatically when CUDA is present; on VRAM exhaustion the codec
