@@ -154,6 +154,7 @@ $('file').onchange = e => addFiles([...e.target.files]);
 function addFiles(fs) {
   files = files.concat(fs);
   renderList();
+  busy(false);
   log('added ' + fs.length + ' file(s), total ' + files.length);
 }
 function renderList() {
