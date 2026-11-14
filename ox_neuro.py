@@ -585,6 +585,7 @@ def _load(path=None):
     arch.setdefault('window', 0)
     model = build_model(**arch)
     model.load_state_dict(ck['model'], strict=False)  # старые чекпоинты без scale_emb
+    model.__dict__['_ckpt_path'] = path
     dev = 'cpu' if _FORCE_CPU or not torch.cuda.is_available() else 'cuda'
     return model.eval().to(dev), dev
 
@@ -771,30 +772,70 @@ def rans_dec_param(blob, bids):
             pos += 1
     return res, pos
 
+def _legacy_cpu_model(model):
+    """Свежая копия чекпоинта, загруженная сразу на CPU: fp32-численность
+    oneDNN зависит от выравнивания буферов, поэтому для переходных файлов
+    воспроизводим условия «чистого» CPU-процесса максимально близко."""
+    global _LEGACY_CPU_MODEL_CACHE
+    path = model.__dict__.get('_ckpt_path')
+    key = ('cpu32', path)
+    if _LEGACY_CPU_MODEL_CACHE is None or _LEGACY_CPU_MODEL_CACHE[0] != key:
+        global _FORCE_CPU
+        old = _FORCE_CPU
+        _FORCE_CPU = True
+        try:
+            m2, _ = _load(path)
+        finally:
+            _FORCE_CPU = old
+        _LEGACY_CPU_MODEL_CACHE = (key, m2)
+    return _LEGACY_CPU_MODEL_CACHE[1]
+
+
+_LEGACY_CPU_MODEL_CACHE = None
+
+
 def _hyper_pair(model, dev):
-    """Отдельная копия hyper-ветки на нужном устройстве (основная модель
-    не трогается; кэшируется на объекте модели)."""
+    """Отдельная копия hyper-ветки на нужном устройстве/точности.
+    'cpu'   — fp64: канон для новых файлов (детерминировано независимо от
+              числа потоков; fp32-конволюции oneDNN гуляют на уровне ulp
+              от процесса к процессу и ломают энтропию);
+    'cpu32'/'cpu32t1' — fp32: файлы недолгой CPU-эпохи (t1 = один поток);
+    'cuda'  — файлы GPU-эпохи (TF32 + bf16-автокаст для больших картинок)."""
     import copy
+    import torch
     cache = model.__dict__.setdefault('_hyper_pair_cache', {})
     if dev not in cache:
-        cache[dev] = (copy.deepcopy(model.hyper_enc).float().to(dev).eval(),
-                      copy.deepcopy(model.hyper_dec).float().to(dev).eval())
+        dtype = torch.float64 if dev == 'cpu' else torch.float32
+        tdev = 'cpu' if dev.startswith('cpu') else dev
+        if dev.startswith('cpu32'):
+            src = _legacy_cpu_model(model)
+            cache[dev] = (src.hyper_enc.eval(), src.hyper_dec.eval())
+        else:
+            cache[dev] = (copy.deepcopy(model.hyper_enc).to(tdev, dtype).eval(),
+                          copy.deepcopy(model.hyper_dec).to(tdev, dtype).eval())
     return cache[dev]
 
 
 def _hyper_mu_b(model, zqd, ht, wt, dev):
     """zqd: torch (T, C) деквантизованный латент -> w ints, mu, logb (T, C).
-    Всегда CPU fp32: mu/buckets задают таблицы энтропии и обязаны совпадать
-    бит-в-бит на любом устройстве — иначе rANS-поток рассыпается."""
+    Всегда CPU fp64 с выключенным oneDNN: mu/buckets задают таблицы энтропии
+    и обязаны совпадать бит-в-бит при любом воспроизведении — oneDNN выбирает
+    ядра свёртки по состоянию процесса, и даже fp64-результат «плывёт»,
+    а с ним и rANS-поток."""
     import torch
     enc, dec = _hyper_pair(model, 'cpu')
     C = zqd.shape[1]
-    grid = zqd.detach().float().cpu().transpose(0, 1).reshape(1, C, ht, wt)
+    grid = zqd.detach().to('cpu', torch.float64).transpose(0, 1).reshape(1, C, ht, wt)
     ph, pw = (-ht) % 4, (-wt) % 4
     gpad = torch.nn.functional.pad(grid, (0, pw, 0, ph), mode='replicate')
-    with torch.no_grad():
-        w = torch.round(enc(gpad))
-        mb = dec(w)
+    mkldnn_on = torch.backends.mkldnn.enabled
+    torch.backends.mkldnn.enabled = False
+    try:
+        with torch.no_grad():
+            w = torch.round(enc(gpad))
+            mb = dec(w)
+    finally:
+        torch.backends.mkldnn.enabled = mkldnn_on
     mb = mb[:, :, :ht, :wt].reshape(1, 2 * C, -1)[0].transpose(0, 1)
     mu, logb = mb.chunk(2, -1)
     wq = w[0].reshape(w.shape[1], -1).transpose(0, 1)  # HC x T' -> T' x HC
@@ -802,37 +843,65 @@ def _hyper_mu_b(model, zqd, ht, wt, dev):
 
 
 def _hyper_from_w(model, w, ht, wt, npix, dev):
-    """mu_r, bids из гипер-латента w. dev='cpu' — численность новых файлов
-    (fp32); dev='cuda' — старых (TF32 + bf16-автокаст для больших картинок)."""
+    """mu_r, bids из гипер-латента w заданной численностью (см. _hyper_pair)."""
     import torch
     HC = w.shape[1]
     ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
     _, dec = _hyper_pair(model, dev)
-    grid = torch.from_numpy(w.astype(np.float32)).to(dev)
+    tdev = 'cpu' if dev.startswith('cpu') else dev
+    dtype = torch.float64 if dev == 'cpu' else torch.float32
+    grid = torch.from_numpy(w.astype(np.float32)).to(tdev, dtype)
     grid = grid.transpose(0, 1).reshape(1, HC, ht4, wt4)
-    with torch.no_grad(), _maybe_autocast(dev, npix):
-        mb = dec(grid)
+    old_nt = torch.get_num_threads() if dev == 'cpu32t1' else None
+    if old_nt is not None:
+        torch.set_num_threads(1)
+    mkldnn_on = torch.backends.mkldnn.enabled
+    if dev == 'cpu':
+        torch.backends.mkldnn.enabled = False   # канон: без oneDNN
+    try:
+        with torch.no_grad(), _maybe_autocast(tdev, npix):
+            mb = dec(grid)
+    finally:
+        torch.backends.mkldnn.enabled = mkldnn_on
+        if old_nt is not None:
+            torch.set_num_threads(old_nt)
     mb = mb[:, :, :ht, :wt].reshape(1, 2 * model.latent, -1)[0].transpose(0, 1)
     mu, logb = mb.chunk(2, -1)
-    mu_r = np.round(mu.float().cpu().numpy()).astype(np.int64)
-    bids = _bucket_idx(logb.float().cpu().numpy())
+    # точность как у выбранной численности: fp64 для канона, fp32 для legacy
+    # (bf16 вывод автокаста расширяется до fp32 без потерь; fp64 не обрезать!)
+    out_dt = torch.float64 if dev == 'cpu' else torch.float32
+    mu_r = np.round(mu.to(out_dt).cpu().numpy()).astype(np.int64)
+    bids = _bucket_idx(logb.to(out_dt).cpu().numpy())
     return mu_r, bids
 
 
 def _decode_resid(model, w, ht, wt, npix, zblob):
     """Подбирает численность гипердекодера по целостности rANS-потока:
-    верные таблицы съедают ровно len(zblob) байт. Новые файлы — CPU fp32,
-    файлы GPU-эпохи — CUDA-вариант."""
+    верные таблицы съедают ровно len(zblob) байт. Порядок: новые файлы
+    (CPU fp64), переходные (CPU fp32, в т.ч. однопоточные), GPU-эпоха."""
     import torch
-    cands = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
+    cands = ['cpu', 'cpu32', 'cpu32t1']
+    if torch.cuda.is_available():
+        cands.append('cuda')
     used = None
     for hdev in cands:
-        mu_r, bids = _hyper_from_w(model, w, ht, wt, npix, hdev)
-        resid, used = rans_dec_param(zblob, bids.reshape(-1))
+        try:
+            mu_r, bids = _hyper_from_w(model, w, ht, wt, npix, hdev)
+            resid, used = rans_dec_param(zblob, bids.reshape(-1))
+        except Exception:
+            continue                      # кандидат недоступен (напр. VRAM=0)
         if used == len(zblob):
             return mu_r, resid
     raise RuntimeError(
         f'corrupt .oxh: entropy stream desync (read {used} of {len(zblob)})')
+
+
+def _verify_stream(zblob, resid, bids):
+    """Страховка энкодера: свежий поток обязан читаться своими же таблицами.
+    Лучше упасть здесь, чем выдать нечитаемый файл."""
+    back, used = rans_dec_param(zblob, bids.reshape(-1))
+    if used != len(zblob) or not np.array_equal(back, resid.reshape(-1)):
+        raise RuntimeError('internal: entropy stream failed self-check')
 
 
 def neuro_compress_hyper(rgb, q=75, ckpt=None):
@@ -859,6 +928,7 @@ def neuro_compress_hyper(rgb, q=75, ckpt=None):
     bids = _bucket_idx(logb)
     zblob = rans_enc_param(resid.reshape(-1).astype(np.int32),
                            bids.reshape(-1))
+    _verify_stream(zblob, resid, bids)
     wblob = _encode_flat(w)          # гипер-латент — ОДНИМ потоком (1 таблица)
     HC = w.shape[1]
     out = bytearray(b'OXN3')
@@ -1047,6 +1117,7 @@ def neuro_compress_adaptive_hyper(rgb, q=75, ckpt=None):
     resid = np.clip(zq - mu_r, -RES_RANGE, RES_RANGE - 1) + RES_RANGE
     bids = _bucket_idx(logb)
     zblob = rans_enc_param(resid.reshape(-1).astype(np.int32), bids.reshape(-1))
+    _verify_stream(zblob, resid, bids)
     wblob = _encode_flat(w)
     mapblob = rans_encode(choice.tobytes())
     HC = w.shape[1]

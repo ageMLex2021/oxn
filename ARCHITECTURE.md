@@ -56,10 +56,14 @@ and a Sobel (high-pass) training loss preserves edge sharpness.
   reference; automatic fallback). The C decoder also reports how many stream
   bytes were consumed: a mismatch with the stream length means the hyperprior
   tables did not match the encoder.
-- Bit-exact entropy across devices: the hyperprior (mu/buckets) runs on CPU
-  fp32 at both ends, so GPU/CPU and VRAM-fallback paths produce identical
-  tables. Files written by the GPU-era build are auto-detected at decode:
-  the stream-length check picks the legacy (CUDA) hyperprior numerics.
+- Bit-exact entropy: the hyperprior (mu/buckets) runs on CPU in float64 with
+  oneDNN disabled at both ends — stock conv results differ at ulp level
+  between processes (oneDNN picks kernels by process state: thread count,
+  buffer alignment), which used to desync the rANS stream on rare occasions.
+  The encoder additionally self-checks every file by decoding the latent
+  stream back before returning it. Legacy files (GPU-era and a short
+  fp32-CPU era) are rescued at decode by a cascade of numerics candidates
+  verified by the stream-length check.
 
 ## Honest limitations
 
