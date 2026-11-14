@@ -1,5 +1,17 @@
 # OXH — OX-Neuro Hyper
 
+> **Disclaimer: use at your own risk.** This is experimental research
+> software. The authors accept no liability for damaged, corrupted or lost
+> images, hardware failures (including GPU damage), or any other damages
+> arising from its use. Always keep backups of your originals — a lossy
+> neural codec is not an archive format. See `LICENSE` (MIT) for the full
+> no-warranty text.
+>
+> **Использование на ваш страх и риск.** Это экспериментальный исследовательский
+> код. Авторы не несут ответственности за повреждённые или утерянные фотографии,
+> выход из строя оборудования (включая GPU) и любой иной ущерб. Всегда
+> сохраняйте оригиналы — lossy-нейрокодек не является архивным форматом.
+
 Neural image compressor: transformer autoencoder + variable-rate scaler +
 per-patch adaptive rate + hyperprior entropy model (rANS). Beats JPEG by up to
 +2.9 dB PSNR at matched bitrates below ~0.3 bpp (see `ARCHITECTURE.md`).

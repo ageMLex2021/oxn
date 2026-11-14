@@ -53,7 +53,13 @@ and a Sobel (high-pass) training loss preserves edge sharpness.
   automatic CPU retry on VRAM exhaustion.
 - EXIF orientation honored on load.
 - Entropy stage accelerated by a C module (bit-identical to the Python
-  reference; automatic fallback).
+  reference; automatic fallback). The C decoder also reports how many stream
+  bytes were consumed: a mismatch with the stream length means the hyperprior
+  tables did not match the encoder.
+- Bit-exact entropy across devices: the hyperprior (mu/buckets) runs on CPU
+  fp32 at both ends, so GPU/CPU and VRAM-fallback paths produce identical
+  tables. Files written by the GPU-era build are auto-detected at decode:
+  the stream-length check picks the legacy (CUDA) hyperprior numerics.
 
 ## Honest limitations
 

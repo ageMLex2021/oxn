@@ -675,7 +675,9 @@ def rans_enc_param_fast(symbols, bids):
 
 
 def rans_dec_param_fast(blob, bids):
-    """C-версия rans_dec_param через subprocess; None при неудаче."""
+    """C-версия rans_dec_param через subprocess; None при неудаче.
+    Возвращает (symbols, consumed): consumed == len(blob), если бакеты
+    совпали с энкодером; иначе поток десинхронизирован."""
     import subprocess
     import tempfile
     try:
@@ -692,7 +694,11 @@ def rans_dec_param_fast(blob, bids):
                                capture_output=True, timeout=3600)
             if r.returncode != 0:
                 return None
-            return np.frombuffer(open(out, 'rb').read(), '<u2').astype(np.int32)
+            raw = open(out, 'rb').read()
+            if len(raw) != len(bids) * 2 + 4:
+                return None
+            (used,) = struct.unpack('<I', raw[-4:])
+            return (np.frombuffer(raw[:-4], '<u2').astype(np.int32), used)
     except Exception:
         return None
 
@@ -745,6 +751,8 @@ def rans_enc_param(symbols, bids):
     return bytes(out)
 
 def rans_dec_param(blob, bids):
+    """-> (symbols, consumed). consumed == len(blob) — поток сошёлся точно;
+    иначе таблицы (бакеты) не совпали с энкодером и symbols — мусор."""
     fast = rans_dec_param_fast(blob, bids)
     if fast is not None:
         return fast
@@ -761,23 +769,70 @@ def rans_dec_param(blob, bids):
         while x < RL:
             x = (x << 8) | (blob[pos] if pos < len(blob) else 0)
             pos += 1
-    return res
+    return res, pos
+
+def _hyper_pair(model, dev):
+    """Отдельная копия hyper-ветки на нужном устройстве (основная модель
+    не трогается; кэшируется на объекте модели)."""
+    import copy
+    cache = model.__dict__.setdefault('_hyper_pair_cache', {})
+    if dev not in cache:
+        cache[dev] = (copy.deepcopy(model.hyper_enc).float().to(dev).eval(),
+                      copy.deepcopy(model.hyper_dec).float().to(dev).eval())
+    return cache[dev]
+
 
 def _hyper_mu_b(model, zqd, ht, wt, dev):
-    """zqd: torch (T, C) деквантизованный латент -> w ints, mu, logb (T, C)."""
+    """zqd: torch (T, C) деквантизованный латент -> w ints, mu, logb (T, C).
+    Всегда CPU fp32: mu/buckets задают таблицы энтропии и обязаны совпадать
+    бит-в-бит на любом устройстве — иначе rANS-поток рассыпается."""
     import torch
+    enc, dec = _hyper_pair(model, 'cpu')
     C = zqd.shape[1]
-    grid = zqd.transpose(0, 1).reshape(1, C, ht, wt)
+    grid = zqd.detach().float().cpu().transpose(0, 1).reshape(1, C, ht, wt)
     ph, pw = (-ht) % 4, (-wt) % 4
     gpad = torch.nn.functional.pad(grid, (0, pw, 0, ph), mode='replicate')
-    with torch.no_grad(), _maybe_autocast(dev, ht * wt * 256):
-        w = torch.round(model.hyper_enc(gpad))
-        mb = model.hyper_dec(w)
+    with torch.no_grad():
+        w = torch.round(enc(gpad))
+        mb = dec(w)
     mb = mb[:, :, :ht, :wt].reshape(1, 2 * C, -1)[0].transpose(0, 1)
     mu, logb = mb.chunk(2, -1)
     wq = w[0].reshape(w.shape[1], -1).transpose(0, 1)  # HC x T' -> T' x HC
-    return (wq.float().cpu().numpy().astype(np.int32),
-            mu.float().cpu().numpy(), logb.float().cpu().numpy())
+    return (wq.numpy().astype(np.int32), mu.numpy(), logb.numpy())
+
+
+def _hyper_from_w(model, w, ht, wt, npix, dev):
+    """mu_r, bids из гипер-латента w. dev='cpu' — численность новых файлов
+    (fp32); dev='cuda' — старых (TF32 + bf16-автокаст для больших картинок)."""
+    import torch
+    HC = w.shape[1]
+    ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
+    _, dec = _hyper_pair(model, dev)
+    grid = torch.from_numpy(w.astype(np.float32)).to(dev)
+    grid = grid.transpose(0, 1).reshape(1, HC, ht4, wt4)
+    with torch.no_grad(), _maybe_autocast(dev, npix):
+        mb = dec(grid)
+    mb = mb[:, :, :ht, :wt].reshape(1, 2 * model.latent, -1)[0].transpose(0, 1)
+    mu, logb = mb.chunk(2, -1)
+    mu_r = np.round(mu.float().cpu().numpy()).astype(np.int64)
+    bids = _bucket_idx(logb.float().cpu().numpy())
+    return mu_r, bids
+
+
+def _decode_resid(model, w, ht, wt, npix, zblob):
+    """Подбирает численность гипердекодера по целостности rANS-потока:
+    верные таблицы съедают ровно len(zblob) байт. Новые файлы — CPU fp32,
+    файлы GPU-эпохи — CUDA-вариант."""
+    import torch
+    cands = ['cpu'] + (['cuda'] if torch.cuda.is_available() else [])
+    used = None
+    for hdev in cands:
+        mu_r, bids = _hyper_from_w(model, w, ht, wt, npix, hdev)
+        resid, used = rans_dec_param(zblob, bids.reshape(-1))
+        if used == len(zblob):
+            return mu_r, resid
+    raise RuntimeError(
+        f'corrupt .oxh: entropy stream desync (read {used} of {len(zblob)})')
 
 
 def neuro_compress_hyper(rgb, q=75, ckpt=None):
@@ -826,17 +881,9 @@ def _neuro_decompress_v3(blob, ckpt):
     ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
     w = _decode_flat(blob[pos:pos + wlen], ht4 * wt4 * HC).reshape(ht4 * wt4, HC)
     pos += wlen
-    wz = torch.from_numpy(w.astype(np.float32)).to(dev)
-    # восстанавливаем (mu, logb) из гипер-латента
-    grid = wz.transpose(0, 1).reshape(1, HC, ht4, wt4)
-    with torch.no_grad(), _maybe_autocast(dev, Hp * Wp):
-        mb = model.hyper_dec(grid)
-    mb = mb[:, :, :ht, :wt].reshape(1, 2 * C, -1)[0].transpose(0, 1)
-    mu, logb = mb.chunk(2, -1)
-    mu_r = np.round(mu.float().cpu().numpy()).astype(np.int64)
-    bids = _bucket_idx(logb.float().cpu().numpy())
     (zlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
-    resid = rans_dec_param(blob[pos:pos + zlen], bids.reshape(-1))
+    mu_r, resid = _decode_resid(model, w, ht, wt, Hp * Wp,
+                                blob[pos:pos + zlen])
     q_lat = resid.reshape(T_, C) - RES_RANGE + mu_r
     zq = (q_lat / s).astype(np.float32)
     z = torch.from_numpy(zq)[None].to(dev)
@@ -1031,20 +1078,13 @@ def _neuro_decompress_v4(blob, ckpt):
     (wlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
     w = _decode_flat(blob[pos:pos + wlen], ht4 * wt4 * HC).reshape(ht4 * wt4, HC)
     pos += wlen
-    wz = torch.from_numpy(w.astype(np.float32)).to(dev)
-    grid = wz.transpose(0, 1).reshape(1, HC, ht4, wt4)
-    with torch.no_grad(), _maybe_autocast(dev, Hp * Wp):
-        mb = model.hyper_dec(grid)
-    mb = mb[:, :, :ht, :wt].reshape(1, 2 * C, -1)[0].transpose(0, 1)
-    mu, logb = mb.chunk(2, -1)
-    mu_r = np.round(mu.float().cpu().numpy()).astype(np.int64)
-    bids = _bucket_idx(logb.float().cpu().numpy())
     (mlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
     smap = np.frombuffer(rans_decode(blob[pos:pos + mlen]), np.uint8)
     pos += mlen
     assert smap.shape[0] == T_
     (zlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
-    resid = rans_dec_param(blob[pos:pos + zlen], bids.reshape(-1))
+    mu_r, resid = _decode_resid(model, w, ht, wt, Hp * Wp,
+                                blob[pos:pos + zlen])
     q_lat = resid.reshape(T_, C) - RES_RANGE + mu_r
     zq = (q_lat / scales[smap][:, None]).astype(np.float32)
     z = torch.from_numpy(zq)[None].to(dev)

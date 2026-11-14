@@ -568,7 +568,8 @@ static uint8_t *ox_decompress(const uint8_t *blob, size_t blob_n,
  *   ox prans d tables.bin blob.bin bids.bin out.bin
  *     blob.bin:   [u32 state BE][body]
  *     bids.bin:   [u32 n][u8 bucket x n]
- *     out.bin:    [u16 sym x n LE]
+ *     out.bin:    [u16 sym x n LE][u32 consumed LE] — consumed != blob.bin size
+ *                 означает, что таблицы не совпали с энкодером (десинхрон)
  */
 static uint8_t *read_file(const char *path, size_t *n);
 static void write_file(const char *path, const uint8_t *d, size_t n);
@@ -621,7 +622,7 @@ static int prans(int argc, char **argv) {
                 for (uint32_t k = cum[s]; k < cum[s + 1]; k++)
                     lut[b * T + k] = (uint16_t)s;
         }
-        uint16_t *out = malloc((size_t)n * 2);
+        uint8_t *out = malloc((size_t)n * 2 + 4);
         uint32_t x = ((uint32_t)bd[0] << 24) | ((uint32_t)bd[1] << 16) |
                      ((uint32_t)bd[2] << 8) | bd[3];
         size_t pos = 4;
@@ -630,13 +631,16 @@ static int prans(int argc, char **argv) {
             uint32_t *cum = cums + (size_t)b * 513;
             uint32_t slot = x & (T - 1);
             uint32_t s = lut[(size_t)b * T + slot];
-            out[i] = (uint16_t)s;
+            ((uint16_t *)out)[i] = (uint16_t)s;
             uint32_t f = cum[s + 1] - cum[s];
             x = f * (x >> SCALE) + slot - cum[s];
             while (x < RANS_L)
                 x = (x << 8) | (pos < bn ? bd[pos] : 0), pos++;
         }
-        write_file(argv[5], (uint8_t *)out, (size_t)n * 2);
+        /* сколько байт потока реально прочитано: != bn => бакеты не те */
+        uint32_t consumed = (uint32_t)pos;
+        memcpy(out + (size_t)n * 2, &consumed, 4);
+        write_file(argv[5], out, (size_t)n * 2 + 4);
         printf("prans d: %u символов\n", n);
         free(out); free(lut); free(bd); free(bids_raw); free(td);
         return 0;
