@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=OXH Viewer
+Comment=Просмотрщик файлов OX-Neuro Hyper (.oxh)
+Exec=python3 /home/acer/Документы/python/oxn/oxh_viewer.py %f
+Icon=image-x-generic
+Terminal=false
+MimeType=application/x-oxh;
+Categories=Graphics;Viewer;
