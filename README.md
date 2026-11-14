@@ -97,8 +97,11 @@ Drag&drop images or whole folders onto the drop zone. Two actions only:
 Quality slider 1..100 (100 = best). The **adaptive** checkbox enables
 per-patch adaptive rate: noticeably smaller files, but much slower on huge
 images (the decoder runs once per rate candidate).
-After the first file finishes, the browser asks where to save; the rest of
-the queue goes to the same folder. Unsupported formats are skipped silently.
+Each queued file has an `x` button to remove it before starting.
+The **choose save dir** button picks the output folder once (Chrome/Edge);
+without it — or if the browser lacks the folder picker, like Firefox —
+results are saved as regular downloads. Unsupported formats are skipped
+silently.
 GPU is used automatically when CUDA is present; on VRAM exhaustion the codec
 retries on CPU automatically.
 

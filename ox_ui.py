@@ -65,7 +65,10 @@ PAGE = r"""<!DOCTYPE html>
            padding:9px 20px; font-size:15px; cursor:pointer; }
   button.ghost { background:#21262d; border:1px solid var(--border); }
   button:disabled { opacity:.45; cursor:default; }
-  #list { margin-top:12px; }
+  .rm { background:transparent; color:var(--dim); border:0; padding:0 4px;
+        font-size:16px; line-height:1; cursor:pointer; }
+  .rm:hover { color:#f85149; }
+  #list { margin-top:12px; max-height:320px; overflow:auto; }
   .file-row { display:flex; justify-content:space-between; gap:10px;
     padding:6px 10px; border-bottom:1px solid var(--border); font-size:14px; }
   .file-row .nm { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
@@ -94,6 +97,13 @@ PAGE = r"""<!DOCTYPE html>
     </div>
     <div id="prog" class="hidden"><i></i></div>
     <div id="list"></div>
+  </div>
+
+  <div class="card">
+    <div class="row">
+      <button id="sd" class="ghost">choose save dir</button>
+      <span id="sdpath" style="color:var(--dim)">not set — files go to Downloads</span>
+    </div>
   </div>
 
   <div class="card">
@@ -152,7 +162,7 @@ drop.ondrop = async e => {
     out.push(...e.dataTransfer.files);
   addFiles(out);
 };
-$('file').onchange = e => addFiles([...e.target.files]);
+$('file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
 
 function addFiles(fs) {
   files = files.concat(fs);
@@ -161,11 +171,18 @@ function addFiles(fs) {
   log('added ' + fs.length + ' file(s), total ' + files.length);
 }
 function renderList() {
-  $('list').innerHTML = files.map(f =>
+  $('list').innerHTML = files.map((f, i) =>
     '<div class="file-row"><span class="nm">' + esc(f.name) +
     '</span><span class="st" data-name="' + esc(f.name) + '">' + fmt(f.size) +
-    '</span></div>').join('');
+    '</span><button class="rm" data-i="' + i + '" title="убрать из очереди">&times;</button></div>').join('');
 }
+$('list').onclick = e => {
+  const b = e.target.closest('.rm');
+  if (!b) return;
+  files.splice(+b.dataset.i, 1);
+  renderList();
+  busy(false);
+};
 function mark(name, text, cls) {
   const el = document.querySelector('.st[data-name="' + CSS.escape(name) + '"]');
   if (el) { el.textContent = text; el.className = 'st ' + cls; }
@@ -185,14 +202,20 @@ function log(msg) {
 function busy(on) {
   $('prog').classList.toggle('hidden', !on);
   $('bc').disabled = $('bd').disabled = on || !files.length;
+  $('sd').disabled = on;
 }
 
 // ---------- куда сохранять ----------
-async function ensureSaveDir() {
-  if (saveDir || !window.showDirectoryPicker) return;   // fallback: скачивание
-  try { saveDir = await showDirectoryPicker({ mode: 'readwrite' }); }
-  catch (e) { saveDir = null; throw e; }   // пользователь отменил — прервать очередь
-}
+$('sd').onclick = async () => {
+  if (!window.showDirectoryPicker) {
+    log('folder picker not supported by this browser — files go to Downloads');
+    return;
+  }
+  try {
+    saveDir = await showDirectoryPicker({ mode: 'readwrite' });
+    $('sdpath').textContent = saveDir.name;
+  } catch (e) { /* отмена — остаётся прежняя папка или Downloads */ }
+};
 async function saveFile(name, blob) {
   if (saveDir) {
     const fh = await saveDir.getFileHandle(name, { create: true });
@@ -222,7 +245,6 @@ async function run(op) {
           mark(f.name, 'skipped', ''); skipped++; continue;
         }
         if (!r.ok) { mark(f.name, 'error', 'err'); log(f.name + ': ' + await r.text()); continue; }
-        if (done === 0) await ensureSaveDir();    // после первого — спросить куда
         const st = JSON.parse(r.headers.get('X-OX-Stats') || '{}');
         const blob = await r.blob();
         await saveFile(st.out_name || f.name, blob);
@@ -231,9 +253,6 @@ async function run(op) {
           : 'done', 'ok');
         done++;
       } catch (e) {
-        if (!saveDir && window.showDirectoryPicker && done === 0) {
-          log('folder selection cancelled — queue stopped'); break;
-        }
         mark(f.name, 'error', 'err'); log(f.name + ': ' + e);
       }
     }
