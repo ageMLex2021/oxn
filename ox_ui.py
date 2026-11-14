@@ -113,6 +113,9 @@ PAGE = r"""<!DOCTYPE html>
       <label style="color:var(--dim)" title="Per-patch adaptive rate: меньше файлы, но заметно дольше">
         <input type="checkbox" id="ad" checked> adaptive (slow but best compress)
       </label>
+      <label style="color:var(--dim)" title="Не пережимать файлы, чей результат уже есть в папке сохранения; отжать — перезаписывать">
+        <input type="checkbox" id="sk" checked> skip existing
+      </label>
       <button id="bc">Compress</button>
       <button id="bd" class="ghost">Decompress</button>
     </div>
@@ -235,6 +238,14 @@ async function run(op) {
   let done = 0, skipped = 0;
   try {
     for (const f of files) {
+      if ($('sk').checked && saveDir) {
+        const outName = op === 'compress' ? f.name + '.oxh'
+          : f.name.replace(/\.oxh$/i, '') + '.jpg';
+        try {
+          await saveDir.getFileHandle(outName);   // существует — не жмём повторно
+          mark(f.name, 'exists — skipped', ''); skipped++; continue;
+        } catch (e) { /* NotFoundError: результата ещё нет */ }
+      }
       const fd = new FormData();
       fd.append('file', f);
       fd.append('q', $('q').value);

@@ -112,10 +112,12 @@ Quality slider 1..100 (100 = best). The **adaptive** checkbox (on by
 default) enables per-patch adaptive rate: noticeably smaller files, but
 much slower on huge images (the decoder runs once per rate candidate).
 Each queued file has an `x` button to remove it before starting.
-The **choose save dir** button picks the output folder once (Chrome/Edge);
-without it — or if the browser lacks the folder picker, like Firefox —
-results are saved as regular downloads. Unsupported formats are skipped
-silently.
+**skip existing** (on by default) skips files whose result already exists in
+the chosen save folder; uncheck it to overwrite. The **choose save dir**
+button picks the output folder once (Chrome/Edge); without it — or if the
+browser lacks the folder picker, like Firefox — results are saved as
+regular downloads (skip-existing works only with a chosen folder).
+Unsupported formats are skipped silently.
 GPU is used automatically when CUDA is present; on VRAM exhaustion the codec
 retries on CPU automatically.
 
