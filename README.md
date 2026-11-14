@@ -98,7 +98,9 @@ pure-Python rANS (everything still works, just slower).
 ## Run the compressor UI
 
 ```bash
-python3 ox_ui.py                      # opens http://127.0.0.1:8000
+./run_ui.sh                             # starts the server if needed and opens
+                                        # http://127.0.0.1:8000 in the browser
+python3 ox_ui.py                        # same, without opening a browser
 python3 ox_ui.py --host 0.0.0.0       # LAN mode: other devices (Windows PC,
                                       # Android phone) use it via browser at
                                       # http://<your-ip>:8000 — no porting needed
