@@ -111,7 +111,7 @@ PAGE = r"""<!DOCTYPE html>
       <span style="color:var(--dim)">quality</span>
       <input type="number" id="q" value="100" min="1" max="100">
       <label style="color:var(--dim)" title="Per-patch adaptive rate: меньше файлы, но заметно дольше">
-        <input type="checkbox" id="ad"> adaptive
+        <input type="checkbox" id="ad" checked> adaptive (slow but best compress)
       </label>
       <button id="bc">Compress</button>
       <button id="bd" class="ghost">Decompress</button>

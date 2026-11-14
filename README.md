@@ -94,9 +94,9 @@ python3 ox_ui.py --host 0.0.0.0       # LAN mode: other devices (Windows PC,
 
 Drag&drop images or whole folders onto the drop zone. Two actions only:
 **Compress** (images -> `.oxh`) and **Decompress** (`.oxh` -> `.jpg`).
-Quality slider 1..100 (100 = best). The **adaptive** checkbox enables
-per-patch adaptive rate: noticeably smaller files, but much slower on huge
-images (the decoder runs once per rate candidate).
+Quality slider 1..100 (100 = best). The **adaptive** checkbox (on by
+default) enables per-patch adaptive rate: noticeably smaller files, but
+much slower on huge images (the decoder runs once per rate candidate).
 Each queued file has an `x` button to remove it before starting.
 The **choose save dir** button picks the output folder once (Chrome/Edge);
 without it — or if the browser lacks the folder picker, like Firefox —
