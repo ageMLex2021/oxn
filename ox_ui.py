@@ -116,6 +116,9 @@ PAGE = r"""<!DOCTYPE html>
       <label style="color:var(--dim)" title="Не пережимать файлы, чей результат уже есть в папке сохранения; отжать — перезаписывать">
         <input type="checkbox" id="sk" checked> skip existing
       </label>
+      <label style="color:var(--dim)" title="После сжатия декодировать поток обратно и сверить (медленно на больших файлах)">
+        <input type="checkbox" id="vf"> verify
+      </label>
       <button id="bc">Compress</button>
       <button id="bd" class="ghost">Decompress</button>
     </div>
@@ -250,6 +253,7 @@ async function run(op) {
       fd.append('file', f);
       fd.append('q', $('q').value);
       fd.append('adaptive', $('ad').checked ? '1' : '0');
+      fd.append('verify', $('vf').checked ? '1' : '0');
       try {
         const r = await fetch('/api/' + op, { method: 'POST', body: fd });
         if (r.status === 415) {           // неподдерживаемый формат — молча
@@ -316,6 +320,8 @@ def do_compress(fields, files):
     cmd = [sys.executable, OX_NEURO, 'c', None, None, '--q', q]
     if fields.get('adaptive') == '1':
         cmd.append('--adaptive')
+    if fields.get('verify') == '1':
+        cmd.append('--verify')
     with tempfile.TemporaryDirectory(prefix='oxh_') as td:
         src = os.path.join(td, name)
         dst = src + '.oxh'

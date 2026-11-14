@@ -113,7 +113,9 @@ default) enables per-patch adaptive rate: noticeably smaller files, but
 much slower on huge images (the decoder runs once per rate candidate).
 Each queued file has an `x` button to remove it before starting.
 **skip existing** (on by default) skips files whose result already exists in
-the chosen save folder; uncheck it to overwrite. The **choose save dir**
+the chosen save folder; uncheck it to overwrite. **verify** (off by default)
+makes the encoder decode the entropy stream back and compare — a safety net
+against unreadable files, slow on huge images. The **choose save dir**
 button picks the output folder once (Chrome/Edge); without it — or if the
 browser lacks the folder picker, like Firefox — results are saved as
 regular downloads (skip-existing works only with a chosen folder).

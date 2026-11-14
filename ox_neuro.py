@@ -569,6 +569,7 @@ def _maybe_autocast(dev, npix):
 
 
 _FORCE_CPU = False     # после CUDA OOM переключаемся на CPU насовсем
+_VERIFY = False        # самопроверка энтропийного потока после сжатия (--verify)
 
 def _load(path=None):
     import torch
@@ -898,7 +899,10 @@ def _decode_resid(model, w, ht, wt, npix, zblob):
 
 def _verify_stream(zblob, resid, bids):
     """Страховка энкодера: свежий поток обязан читаться своими же таблицами.
-    Лучше упасть здесь, чем выдать нечитаемый файл."""
+    Лучше упасть здесь, чем выдать нечитаемый файл. По умолчанию выключена
+    (дорого на больших картинках) — включается флагом --verify."""
+    if not _VERIFY:
+        return
     back, used = rans_dec_param(zblob, bids.reshape(-1))
     if used != len(zblob) or not np.array_equal(back, resid.reshape(-1)):
         raise RuntimeError('internal: entropy stream failed self-check')
@@ -1340,7 +1344,13 @@ def main():
     ap.add_argument('--ckpt', default=None, help='checkpoint for c/d/bench')
     ap.add_argument('--adaptive', action='store_true',
                     help='per-patch adaptive rate (OXN2/OXN4)')
+    ap.add_argument('--verify', action='store_true',
+                    help='после сжатия декодировать энтропийный поток обратно '
+                         'и сверить (медленно на больших изображениях)')
     a = ap.parse_args()
+    if a.verify:
+        global _VERIFY
+        _VERIFY = True
 
     def with_cpu_fallback(fn, *fargs):
         """При нехватке VRAM — повтор на CPU (в RAM)."""

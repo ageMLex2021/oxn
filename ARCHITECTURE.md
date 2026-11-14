@@ -60,8 +60,9 @@ and a Sobel (high-pass) training loss preserves edge sharpness.
   oneDNN disabled at both ends — stock conv results differ at ulp level
   between processes (oneDNN picks kernels by process state: thread count,
   buffer alignment), which used to desync the rANS stream on rare occasions.
-  The encoder additionally self-checks every file by decoding the latent
-  stream back before returning it. Legacy files (GPU-era and a short
+  The encoder can optionally self-check a file by decoding the latent stream
+  back (`--verify` / the verify checkbox; off by default — slow on huge
+  images). Legacy files (GPU-era and a short
   fp32-CPU era) are rescued at decode by a cascade of numerics candidates
   verified by the stream-length check.
 
