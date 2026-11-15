@@ -163,4 +163,4 @@ python3 ox_neuro.py bench photo.jpg        # vs JPEG table
 | `ox.c` / `ox_cuda.cu` / `Makefile` / `ox` | C/CUDA accelerator (`prans`) |
 | `ox_ui.py` | compressor web UI |
 | `oxh_viewer.py` | .oxh viewer |
-| `ox_neuro.pt` | model checkpoint (not in git) |
+| `ox_neuro.pt` | model checkpoint |
