@@ -1065,6 +1065,72 @@ LADDER = (0.35, 0.6, 1.0, 1.7, 2.9, 5.0, 8.0)
 TAU = 15.0       # калибровано на Kodak: lam = TAU / s0^2
 
 
+# ---- boost: выбор степени маленькой conv-сетью вместо 7 декодирований -----
+BOOST_FILE = os.path.join(HERE, 'ox_boost.pt')
+_BOOST = None          # (net, mu, sd) или False
+_BOOST_ON = False      # включается флагом --boost / чекбоксом в UI
+
+
+def _boost_net(dev):
+    """Свёрточная сеть над гридом латентов: z(24)+E(7)+R(7)+pix(4)+Dmid
+    каналов -> log D_k на патч. Два полных декодирования вместо семи."""
+    global _BOOST
+    if _BOOST is None:
+        if not os.path.exists(BOOST_FILE):
+            _BOOST = False
+        else:
+            import torch
+            ck = torch.load(BOOST_FILE, map_location='cpu', weights_only=True)
+            h = int(ck.get('hidden', 96))
+            kmax = int(ck.get('kmax', 5))
+            mid = list(ck.get('mid', [1, 3]))
+            state = {k[4:] if k.startswith('net.') else k: v
+                     for k, v in ck['state'].items()}
+            nch = int(state['0.weight'].shape[1])
+            n_conv = sum(1 for k in state if k.endswith('.weight'))
+            layers = [torch.nn.Conv2d(nch, h, 3, padding=1), torch.nn.GELU()]
+            for _ in range(n_conv - 2):
+                layers += [torch.nn.Conv2d(h, h, 3, padding=1), torch.nn.GELU()]
+            layers += [torch.nn.Conv2d(h, kmax, 1)]
+            net = torch.nn.Sequential(*layers)
+            net.load_state_dict(state)
+            _BOOST = (net.eval().to(dev), ck['mu'].to(dev), ck['sd'].to(dev),
+                      mid, kmax)
+    return _BOOST
+
+
+def _pix_feats(canvas, ht, wt, p):
+    """Как при обучении: log1p(var), log1p|gx|, log1p|gy|, комбинированная."""
+    g = canvas.mean(2)
+    pv = g.reshape(ht, p, wt, p).var((1, 3))
+    dgx = np.pad(np.abs(np.diff(g, axis=1)), ((0, 0), (0, 1)))
+    dgx = dgx.reshape(ht, p, wt, p).mean((1, 3))
+    dgy = np.pad(np.abs(np.diff(g, axis=0)), ((0, 1), (0, 0)))
+    dgy = dgy.reshape(ht, p, wt, p).mean((1, 3))
+    return np.stack([np.log1p(pv), np.log1p(dgx), np.log1p(dgy),
+                     np.log1p(pv * 0.5 + dgx * dgy)], 0).astype(np.float32)
+
+
+def _boost_predict(model, canvas, zs, E, R, D_mid, ht, wt, p, dev):
+    """D_k на патч: точные для mid-скейлов (2 декодирования), остальные —
+    предсказание conv-сети. zs: (T, C); E, R: (7, T); D_mid: (len(mid), T)."""
+    import torch
+    net, mu, sd, mid, kmax = _boost_net(dev)
+    px = _pix_feats(canvas, ht, wt, p)
+    dm = np.log1p(D_mid).astype(np.float32)
+    X = np.concatenate([zs.T, E, R, px.reshape(4, -1), dm], 0).astype(np.float32)
+    nch = X.shape[0]
+    with torch.no_grad():
+        xb = (torch.from_numpy(X.reshape(nch, ht, wt)).to(dev)
+              - mu[:, None, None]) / sd[:, None, None]
+        Dh = np.exp(net(xb[None])[0].float().cpu().numpy().reshape(kmax, -1)) - 1.0
+    D = np.full((len(LADDER), Dh.shape[1]), 1e9, np.float32)
+    D[:kmax] = Dh
+    for i, k in enumerate(mid):
+        D[k] = D_mid[i]
+    return D
+
+
 def neuro_compress_adaptive_hyper(rgb, q=75, ckpt=None):
     """OXN4: адаптивная степень по патчам + hyperprior.
     Оценка битрейта кандидатов — по (mu, b) от hyper при базовой степени;
@@ -1095,17 +1161,32 @@ def neuro_compress_adaptive_hyper(rgb, q=75, ckpt=None):
     _, mu0, logb0 = _hyper_mu_b(model, zqd0, ht, wt, dev)
     b0 = np.log1p(np.exp(logb0)) + 1e-2                  # softplus, как в модели
     mu0r = np.round(mu0)
-    Dk, Rk, Qk = [], [], []
-    for s in LADDER:
+    Dk, Rk, Qk, Ek = [], [], [], []
+    use_boost = _BOOST_ON and _boost_net(dev) is not False
+    mid = _boost_net(dev)[3] if use_boost else []
+    for k, s in enumerate(LADDER):
         qk = np.round(zs * s)
         Qk.append(qk)
         Rk.append((np.abs(qk - mu0r) / b0).sum(axis=1))  # остаток к mu0
-        zt = torch.from_numpy((qk / s).astype(np.float32))[None].to(dev)
-        lg = torch.full((1, T_), math.log(s), device=dev)
-        xrn = _run_decode(model, zt, Hp, Wp, lg, dev)
-        d = ((xrn - canvas) ** 2).mean(2)
-        Dk.append(d.reshape(ht, p, wt, p).mean(axis=(1, 3)).reshape(-1) * 65025.0)
-    D = np.stack(Dk)
+        if use_boost:
+            Ek.append(((zs * s - qk) ** 2).mean(axis=1))
+            if k in mid:                       # только mid-скейлы декодируем
+                zt = torch.from_numpy((qk / s).astype(np.float32))[None].to(dev)
+                lg = torch.full((1, T_), math.log(s), device=dev)
+                xrn = _run_decode(model, zt, Hp, Wp, lg, dev)
+                d = ((xrn - canvas) ** 2).mean(2)
+                Dk.append(d.reshape(ht, p, wt, p).mean(axis=(1, 3)).reshape(-1) * 65025.0)
+        else:
+            zt = torch.from_numpy((qk / s).astype(np.float32))[None].to(dev)
+            lg = torch.full((1, T_), math.log(s), device=dev)
+            xrn = _run_decode(model, zt, Hp, Wp, lg, dev)
+            d = ((xrn - canvas) ** 2).mean(2)
+            Dk.append(d.reshape(ht, p, wt, p).mean(axis=(1, 3)).reshape(-1) * 65025.0)
+    if use_boost:
+        D = _boost_predict(model, canvas, zs, np.stack(Ek), np.stack(Rk),
+                           np.stack(Dk), ht, wt, p, dev)
+    else:
+        D = np.stack(Dk)
     R = np.stack(Rk)
     choice = np.argmin(D + lam * R, axis=0).astype(np.uint8)
     zq = np.zeros_like(Qk[0], dtype=np.int64)
@@ -1347,10 +1428,16 @@ def main():
     ap.add_argument('--verify', action='store_true',
                     help='после сжатия декодировать энтропийный поток обратно '
                          'и сверить (медленно на больших изображениях)')
+    ap.add_argument('--boost', action='store_true',
+                    help='adaptive: степень по патчам выбирает маленькая '
+                         'conv-сеть (ox_boost.pt) вместо 7 прогонов декодера')
     a = ap.parse_args()
     if a.verify:
         global _VERIFY
         _VERIFY = True
+    if a.boost:
+        global _BOOST_ON
+        _BOOST_ON = True
 
     def with_cpu_fallback(fn, *fargs):
         """При нехватке VRAM — повтор на CPU (в RAM)."""

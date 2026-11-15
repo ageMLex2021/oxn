@@ -42,6 +42,11 @@ and a Sobel (high-pass) training loss preserves edge sharpness.
 - At ~1% of source size JPEG collapses into color noise while OX-Neuro keeps
   content intact (faces, tones).
 - Adaptive vs flat: −37…60% size at almost the same PSNR.
+- Optional boost (`--boost`, `ox_boost.pt`): the per-patch scale is chosen
+  by a small conv net fed with the latent, per-scale quant error, bitrate
+  estimates, patch pixel stats and the true distortions of only 2 of the 7
+  ladder scales — ~2.3x faster adaptive encode for ≈0.5 dB PSNR. Trained on
+  the ladder's own outputs (no external labels).
 - Real 201 MP photo (14142×14235): 0.426 bpp, roundtrip PSNR 32.6 dB,
   ~20 s encode (GPU), ~20 s decode to JPEG; CPU works too.
 

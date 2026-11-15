@@ -111,6 +111,9 @@ Drag&drop images or whole folders onto the drop zone. Two actions only:
 Quality slider 1..100 (100 = best). The **adaptive** checkbox (on by
 default) enables per-patch adaptive rate: noticeably smaller files, but
 much slower on huge images (the decoder runs once per rate candidate).
+**boost speed for adaptive** (on by default) replaces 5 of the 7 decoder
+runs with a small conv predictor (`ox_boost.pt`): ~2.3x faster adaptive at
+the cost of roughly 0.5 dB PSNR. Needs `ox_boost.pt` next to `ox_neuro.pt`.
 Each queued file has an `x` button to remove it before starting.
 **skip existing** (on by default) skips files whose result already exists in
 the chosen save folder; uncheck it to overwrite. **verify** (off by default)

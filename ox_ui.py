@@ -113,6 +113,9 @@ PAGE = r"""<!DOCTYPE html>
       <label style="color:var(--dim)" title="Per-patch adaptive rate: меньше файлы, но заметно дольше">
         <input type="checkbox" id="ad" checked> adaptive (slow but best compress)
       </label>
+      <label style="color:var(--dim)" title="Adaptive в ~2.3 раза быстрее: степень выбирает маленькая нейросеть (2 прогона декодера вместо 7); цена — около 0.5 дБ PSNR; работает только при включённом adaptive">
+        <input type="checkbox" id="bs" checked> boost speed for adaptive
+      </label>
       <label style="color:var(--dim)" title="Не пережимать файлы, чей результат уже есть в папке сохранения; отжать — перезаписывать">
         <input type="checkbox" id="sk" checked> skip existing
       </label>
@@ -169,6 +172,7 @@ drop.ondrop = async e => {
   addFiles(out);
 };
 $('file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+$('ad').onchange = () => { $('bs').disabled = !$('ad').checked; };
 
 function addFiles(fs) {
   files = files.concat(fs);
@@ -220,7 +224,11 @@ $('sd').onclick = async () => {
   try {
     saveDir = await showDirectoryPicker({ mode: 'readwrite' });
     $('sdpath').textContent = saveDir.name;
-  } catch (e) { /* отмена — остаётся прежняя папка или Downloads */ }
+  } catch (e) {
+    if (e && (e.name === 'NotAllowedError' || e.name === 'SecurityError'))
+      log('browser blocks this folder (system dir like Downloads/Desktop) — pick a subfolder inside it');
+    /* отмена — остаётся прежняя папка или Downloads */
+  }
 };
 async function saveFile(name, blob) {
   if (saveDir) {
@@ -253,6 +261,7 @@ async function run(op) {
       fd.append('file', f);
       fd.append('q', $('q').value);
       fd.append('adaptive', $('ad').checked ? '1' : '0');
+      fd.append('boost', $('bs').checked ? '1' : '0');
       fd.append('verify', $('vf').checked ? '1' : '0');
       try {
         const r = await fetch('/api/' + op, { method: 'POST', body: fd });
@@ -320,6 +329,8 @@ def do_compress(fields, files):
     cmd = [sys.executable, OX_NEURO, 'c', None, None, '--q', q]
     if fields.get('adaptive') == '1':
         cmd.append('--adaptive')
+        if fields.get('boost') == '1':
+            cmd.append('--boost')
     if fields.get('verify') == '1':
         cmd.append('--verify')
     with tempfile.TemporaryDirectory(prefix='oxh_') as td:
