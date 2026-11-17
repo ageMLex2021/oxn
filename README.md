@@ -50,8 +50,7 @@ pip install -r requirements.txt
    install [MinGW-w64](https://www.mingw-w64.org/) or use WSL and run
    `gcc -O3 -o ox.exe ox.c` (the CUDA part needs the NVIDIA CUDA toolkit and
    `nvcc`; without it just skip).
-5. Copy the model checkpoint `ox_neuro.pt` into the folder (see
-   "Model checkpoint" below), then:
+5. Run:
 
 ```bat
 python ox_ui.py
@@ -70,12 +69,17 @@ python "%~dp0oxh_viewer.py" %*
 
 and select that `.bat` as the default app for `.oxh`.
 
-## Model checkpoint
+## Model checkpoints
 
-The file `ox_neuro.pt` (~67 MB) is NOT in git (see `.gitignore`). Either:
+Both models are in git — no training needed:
 
-- copy a trained checkpoint into this folder as `ox_neuro.pt`, or
-- train your own: put training images into `data/train/` and run
+- `ox_neuro.pt` (~67 MB) — the codec itself (autoencoder + hyperprior);
+- `ox_boost.pt` (~0.8 MB) — the small conv predictor for the adaptive
+  **boost** mode (optional; without it boost silently falls back to the
+  full ladder).
+
+To retrain the codec from scratch: put training images into `data/train/`
+and run
 
 ```bash
 python3 ox_neuro.py train --steps 40000 --batch 8 --data data/train \
@@ -166,4 +170,5 @@ python3 ox_neuro.py bench photo.jpg        # vs JPEG table
 | `ox.c` / `ox_cuda.cu` / `Makefile` / `ox` | C/CUDA accelerator (`prans`) |
 | `ox_ui.py` | compressor web UI |
 | `oxh_viewer.py` | .oxh viewer |
-| `ox_neuro.pt` | model checkpoint |
+| `ox_neuro.pt` | codec checkpoint |
+| `ox_boost.pt` | conv predictor for adaptive boost mode |
