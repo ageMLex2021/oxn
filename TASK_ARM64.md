@@ -46,9 +46,12 @@ pip install -r requirements.txt          # torch, numpy, pillow
   будет CPU (MPS в коде не задействован): работает, но полный ретрен
   кодека на CPU непрактичен; ctx-сети обучаются и на CPU.
 - C-ускоритель: `make` (нужен gcc; `make gpu` — если есть nvcc).
-- Данные: скопировать со старой машины `data/` из
-  `/home/acer/Документы/python/ox/data/` — `train/` (1422 img, 3.8 ГБ),
-  `kodak/`, `test/` (holdout kodim21–24).
+- Данные: скопировать со старой машины папку `data/` из
+  `/home/acer/Документы/python/ox/data/` **внутрь `oxn/`** (т.е.
+  `oxn/data/train/` — 1422 img, 3.8 ГБ; `oxn/data/kodak/`;
+  `oxn/data/test/` — holdout kodim21–24). В git она не попадёт:
+  `data/` добавлена в `.gitignore` на ветке. Все команды ниже
+  рассчитаны именно на это расположение.
 
 ### Проверка после переноса (обязательно)
 
