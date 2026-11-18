@@ -1352,17 +1352,18 @@ def _anchor_mask(ht, wt):
     return ((ii + jj) % 2 == 0).reshape(-1)
 
 
-def _ctx_params(ctx, zg, mu, logb, logs, ht, wt):
+def _ctx_params(ctx, zg, mu, logb, logs_map, ht, wt):
     """zg: (T, C) латент с занулёнными не-якорями; mu, logb: (T, C) от
-    hyperprior -> dmu, log_sig (T, C) fp64 для всех токенов (используются
-    только не-якорные). CPU fp64, mkldnn off — канон, как _hyper_mu_b."""
+    hyperprior; logs_map: (T,) fp64 — log потокенной степени сжатия.
+    -> dmu, log_sig (T, C) fp64 для всех токенов (используются только
+    не-якорные). CPU fp64, mkldnn off — канон, как _hyper_mu_b."""
     import torch
     C = zg.shape[1]
     feats = np.concatenate([
         zg.T.reshape(1, C, ht, wt),
         mu.T.reshape(1, C, ht, wt),
         logb.T.reshape(1, C, ht, wt),
-        np.full((1, 1, ht, wt), logs, np.float64)], axis=1)
+        logs_map.astype(np.float64).reshape(1, 1, ht, wt)], axis=1)
     mkldnn_on = torch.backends.mkldnn.enabled
     torch.backends.mkldnn.enabled = False
     try:
@@ -1436,7 +1437,8 @@ def neuro_compress_v5(rgb, q=75, ckpt=None):
     zg = np.zeros((T_, C), np.float64)
     zg[anch] = (resid[anch] - RES_RANGE + mu_r[anch]) / s
     ctx = _ctx_net(C)
-    dmu, lsig = _ctx_params(ctx, zg, mu, logb, math.log(s), ht, wt)
+    dmu, lsig = _ctx_params(ctx, zg, mu, logb, np.full(T_, math.log(s)),
+                            ht, wt)
     mu_nr = np.round(mu + dmu).astype(np.int64)
     resid_n = np.clip(q_lat - mu_nr, -RES_RANGE, RES_RANGE - 1) + RES_RANGE
     sig = np.log1p(np.exp(lsig)) + 1e-2
@@ -1495,7 +1497,8 @@ def _neuro_decompress_v5(blob, ckpt):
     zg = np.zeros((T_, C), np.float64)
     zg[anch] = q_lat[anch] / s
     ctx = _ctx_net(C)
-    dmu, lsig = _ctx_params(ctx, zg, mu, logb, math.log(s), ht, wt)
+    dmu, lsig = _ctx_params(ctx, zg, mu, logb, np.full(T_, math.log(s)),
+                            ht, wt)
     sig = np.log1p(np.exp(lsig)) + 1e-2
     bids_n = (N_BUCK + _bucket_idx(np.log(sig)))[~anch]
     (nlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
@@ -1509,9 +1512,160 @@ def _neuro_decompress_v5(blob, ckpt):
     return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+def neuro_compress_v6(rgb, q=75, ckpt=None):
+    """OXN6: адаптивная степень по патчам (лесенка OXN4) + контекстная
+    энтропийная модель (OXN5): якоря — Лаплас от hyperprior, остальные —
+    Гаусс от контекстной сети, видящей якоря и карту log s."""
+    import torch
+    model, dev = _load(ckpt)
+    if getattr(model, 'hyper_enc', None) is None:
+        sys.exit('OXN6 требует hyper-чекпоинт (--hyper при обучении кодека)')
+    p = model.patch
+    H, W = rgb.shape[:2]
+    canvas, Hp, Wp = _pad_image(rgb, p)
+    ht, wt = Hp // p, Wp // p
+    x = torch.from_numpy(canvas).permute(2, 0, 1)[None]
+    if dev == 'cuda' and Hp * Wp > 16_000_000:
+        x = x.to(torch.bfloat16)
+    x = x.to(dev)
+    s0 = q2s(q)
+    lam = TAU / (s0 * s0)
+    with torch.no_grad(), _maybe_autocast(dev, Hp * Wp):
+        z = model.encode(x)[0]
+    del x
+    if dev == 'cuda':
+        torch.cuda.empty_cache()
+    zf = z.float()
+    T_, C = zf.shape
+    zs = zf.cpu().numpy()
+    # hyper при базовой степени — для оценок битрейта кандидатов
+    q0 = np.round(zs * s0)
+    zqd0 = torch.from_numpy((q0 / s0).astype(np.float32)).to(dev)
+    _, mu0, logb0 = _hyper_mu_b(model, zqd0, ht, wt, dev)
+    b0 = np.log1p(np.exp(logb0)) + 1e-2
+    mu0r = np.round(mu0)
+    Dk, Rk, Qk, Ek = [], [], [], []
+    use_boost = _BOOST_ON and _boost_net(dev) is not False
+    mid = _boost_net(dev)[3] if use_boost else []
+    for k, s in enumerate(LADDER):
+        qk = np.round(zs * s)
+        Qk.append(qk)
+        Rk.append((np.abs(qk - mu0r) / b0).sum(axis=1))
+        if use_boost:
+            Ek.append(((zs * s - qk) ** 2).mean(axis=1))
+            if k in mid:
+                zt = torch.from_numpy((qk / s).astype(np.float32))[None].to(dev)
+                lg = torch.full((1, T_), math.log(s), device=dev)
+                xrn = _run_decode(model, zt, Hp, Wp, lg, dev)
+                d = ((xrn - canvas) ** 2).mean(2)
+                Dk.append(d.reshape(ht, p, wt, p).mean(axis=(1, 3)).reshape(-1) * 65025.0)
+        else:
+            zt = torch.from_numpy((qk / s).astype(np.float32))[None].to(dev)
+            lg = torch.full((1, T_), math.log(s), device=dev)
+            xrn = _run_decode(model, zt, Hp, Wp, lg, dev)
+            d = ((xrn - canvas) ** 2).mean(2)
+            Dk.append(d.reshape(ht, p, wt, p).mean(axis=(1, 3)).reshape(-1) * 65025.0)
+    if use_boost:
+        D = _boost_predict(model, canvas, zs, np.stack(Ek), np.stack(Rk),
+                           np.stack(Dk), ht, wt, p, dev)
+    else:
+        D = np.stack(Dk)
+    R = np.stack(Rk)
+    choice = np.argmin(D + lam * R, axis=0).astype(np.uint8)
+    zq = np.zeros_like(Qk[0], dtype=np.int64)
+    for k in range(len(LADDER)):
+        m = choice == k
+        zq[m] = Qk[k][m]
+    # каноничные степени — float16, как в заголовке: входы контекстной сети
+    # (zg и карта log s) обязаны совпасть с декодером бит-в-бит
+    scales16 = np.array(LADDER, np.float16)
+    stok = scales16[choice].astype(np.float32)                 # (T,)
+    # финальный hyper от смешанного латента
+    zqd = torch.from_numpy((zq / stok[:, None]).astype(np.float32)).to(dev)
+    w, mu, logb = _hyper_mu_b(model, zqd, ht, wt, dev)
+    anch = _anchor_mask(ht, wt)
+    # якоря: Лаплас от hyperprior (бакеты 0..23)
+    mu_r = np.round(mu).astype(np.int64)
+    resid = np.clip(zq - mu_r, -RES_RANGE, RES_RANGE - 1) + RES_RANGE
+    ablob = _enc_syms(resid[anch], _bucket_idx(logb)[anch])
+    # не-якоря: Гаусс от контекстной сети (бакеты 24..47); в контекст идёт
+    # ДЕКОДИРУЕМАЯ версия якорей (клиппинг ±256), как в OXN5
+    zg = np.zeros((T_, C), np.float64)
+    zg[anch] = (resid[anch] - RES_RANGE + mu_r[anch]) / stok[anch, None]
+    ctx = _ctx_net(C)
+    dmu, lsig = _ctx_params(ctx, zg, mu, logb,
+                            np.log(stok.astype(np.float64)), ht, wt)
+    mu_nr = np.round(mu + dmu).astype(np.int64)
+    resid_n = np.clip(zq - mu_nr, -RES_RANGE, RES_RANGE - 1) + RES_RANGE
+    sig = np.log1p(np.exp(lsig)) + 1e-2
+    nblob = _enc_syms(resid_n[~anch], N_BUCK + _bucket_idx(np.log(sig))[~anch])
+    wblob = _encode_flat(w)
+    mapblob = rans_encode(choice.tobytes())
+    HC = w.shape[1]
+    out = bytearray(b'OXN6')
+    out += struct.pack('<HHBB', H, W, p, C)
+    out += struct.pack('<B', len(LADDER))
+    for s_ in scales16:
+        out += struct.pack('<e', float(s_))
+    out += struct.pack('<H', HC)
+    out += struct.pack('<I', len(wblob)) + wblob
+    out += struct.pack('<I', len(mapblob)) + mapblob
+    out += struct.pack('<I', len(ablob)) + ablob
+    out += struct.pack('<I', len(nblob)) + nblob
+    return bytes(out)
+
+
+def _neuro_decompress_v6(blob, ckpt):
+    import torch
+    H, W, p, C = struct.unpack('<HHBB', blob[4:10])
+    (K,) = struct.unpack('<B', blob[10:11])
+    scales = np.array(struct.unpack(f'<{K}e', blob[11:11 + 2 * K]), np.float32)
+    pos = 11 + 2 * K
+    (HC,) = struct.unpack('<H', blob[pos:pos + 2]); pos += 2
+    model, dev = _load(ckpt)
+    Hp = (H + p - 1) // p * p
+    Wp = (W + p - 1) // p * p
+    ht, wt = Hp // p, Wp // p
+    T_ = ht * wt
+    ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
+    (wlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    w = _decode_flat(blob[pos:pos + wlen], ht4 * wt4 * HC).reshape(ht4 * wt4, HC)
+    pos += wlen
+    (mlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    smap = np.frombuffer(rans_decode(blob[pos:pos + mlen]), np.uint8)
+    pos += mlen
+    assert smap.shape[0] == T_
+    stok = scales[smap]                                        # (T,) float32
+    mu, logb = _hyper_raw_from_w(model, w, ht, wt)
+    anch = _anchor_mask(ht, wt)
+    na, nn_ = int(anch.sum()), T_ - int(anch.sum())
+    (alen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    resid_a = _dec_syms(blob[pos:pos + alen], _bucket_idx(logb)[anch])
+    pos += alen
+    q_lat = np.zeros((T_, C), np.int64)
+    q_lat[anch] = resid_a.reshape(na, C) - RES_RANGE + np.round(mu[anch])
+    zg = np.zeros((T_, C), np.float64)
+    zg[anch] = q_lat[anch] / stok[anch, None]
+    ctx = _ctx_net(C)
+    dmu, lsig = _ctx_params(ctx, zg, mu, logb,
+                            np.log(stok.astype(np.float64)), ht, wt)
+    sig = np.log1p(np.exp(lsig)) + 1e-2
+    bids_n = (N_BUCK + _bucket_idx(np.log(sig)))[~anch]
+    (nlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    resid_n = _dec_syms(blob[pos:pos + nlen], bids_n)
+    q_lat[~anch] = (resid_n.reshape(nn_, C) - RES_RANGE
+                    + np.round(mu + dmu)[~anch])
+    zq = q_lat / stok[:, None]
+    z = torch.from_numpy(zq.astype(np.float32))[None].to(dev)
+    lg = torch.log(torch.from_numpy(stok))[None].to(dev)
+    xr = _run_decode(model, z, Hp, Wp, lg, dev)
+    return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
 def cmd_trainctx(args):
-    """Обучение контекстной ветки OXN5: энкодер и hyperprior заморожены,
-    минимизируется энтропия не-якорных токенов под дискретным Гауссом."""
+    """Обучение контекстной ветки OXN5/OXN6: энкодер и hyperprior
+    заморожены, минимизируется энтропия не-якорных токенов под дискретным
+    Гауссом."""
     import torch
     model, dev = _load(args.ckpt)
     if getattr(model, 'hyper_enc', None) is None:
@@ -1564,16 +1718,30 @@ def cmd_trainctx(args):
             xs.append(c)
         xb = (torch.stack(xs).to(dev, non_blocking=True)
               .permute(0, 3, 1, 2).float() / 255.0)
-        s0 = math.exp(np.random.uniform(math.log(S_MIN), math.log(S_MAX)))
+        # поле степеней: 40% равномерное, 60% кусочно-постоянное — как при
+        # обучении кодека; так одна ctx-сеть обслуживает и OXN5, и OXN6
+        T_ = g * g
+        if np.random.rand() < 0.4:
+            s0 = math.exp(np.random.uniform(math.log(S_MIN), math.log(S_MAX)))
+            smap = torch.full((args.batch, T_), s0, device=dev)
+        else:
+            bs = int(np.random.choice([2, 4, 8, 16]))
+            nb = g // bs
+            fields = np.exp(np.random.uniform(math.log(S_MIN), math.log(S_MAX),
+                                              size=(args.batch, nb, nb)))
+            field = np.repeat(np.repeat(fields, bs, 1), bs, 2)
+            smap = torch.from_numpy(
+                field.reshape(args.batch, T_).astype(np.float32)).to(dev)
         with torch.no_grad():
             z = model.encode(xb)                              # B x T x C
-            q_lat = torch.round(z * s0)
-            grid = (q_lat / s0).transpose(1, 2).reshape(args.batch, C, g, g)
+            q_lat = torch.round(z * smap.unsqueeze(-1))
+            grid = (q_lat / smap.unsqueeze(-1)).transpose(1, 2).reshape(
+                args.batch, C, g, g)
             w = torch.round(model.hyper_enc(grid))
             mu_h, logb_h = model.hyper_dec(w).chunk(2, 1)     # B x C x g x g
         zg = grid * anch.reshape(1, 1, g, g)                  # не-якоря = 0
         feats = torch.cat([zg, mu_h, logb_h,
-                           torch.full_like(mu_h[:, :1], math.log(s0))], 1)
+                           torch.log(smap).reshape(args.batch, 1, g, g)], 1)
         dmu, lsig = ctx(feats).chunk(2, 1)
         mu = mu_h + dmu
         sig = torch.nn.functional.softplus(lsig) + 1e-2
@@ -1596,7 +1764,7 @@ def cmd_trainctx(args):
                 bh = (bits_h * msel).sum() / (msel.sum() * args.batch)
             print(f'  step {step:5d}/{args.steps}  '
                   f'bits/ctx-tok {loss.item():.3f}  hyper-only {bh.item():.3f} '
-                  f'(s={s0:.2f})  ({time.time() - t0:.0f} с)')
+                  f'(s~{smap.mean().item():.2f})  ({time.time() - t0:.0f} с)')
         if step % 2000 == 0:
             torch.save({'state': ctx.state_dict(), 'latent': C,
                         'hidden': args.ctx_hidden}, CTX_FILE + '.part')
@@ -1689,7 +1857,7 @@ def neuro_decompress(blob, ckpt=None):
     import torch
     magic = blob[:4]
     # hyper-форматы требуют hyper-модель; если выбранная без неё — ищем подходящую
-    if magic in (b'OXN3', b'OXN4', b'OXN5'):
+    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6'):
         model, _ = _load(ckpt)
         if getattr(model, 'hyper_enc', None) is None:
             for alt in ('ox_neuro_v10.pt', 'ox_neuro_v9.pt'):
@@ -1697,6 +1865,8 @@ def neuro_decompress(blob, ckpt=None):
                 if os.path.exists(p):
                     ckpt = p
                     break
+    if magic == b'OXN6':
+        return _neuro_decompress_v6(blob, ckpt)
     if magic == b'OXN5':
         return _neuro_decompress_v5(blob, ckpt)
     if magic == b'OXN4':
@@ -1753,6 +1923,11 @@ def cmd_bench(args):
             rec = neuro_decompress(blob, args.ckpt)
             print(f'{"OXN5-ctx q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
                   f'{psnr(rgb, rec):7.2f}')
+        for q in (5, 15, 30, 50, 75, 92):
+            blob = neuro_compress_v6(rgb, q, args.ckpt)
+            rec = neuro_decompress(blob, args.ckpt)
+            print(f'{"OXN6-адапт q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
+                  f'{psnr(rgb, rec):7.2f}')
 
 
 def main():
@@ -1799,6 +1974,9 @@ def main():
     ap.add_argument('--v5', action='store_true',
                     help='формат OXN5: checkerboard-контекст + Гаусс '
                          '(нужен обученный ox_ctx.pt, см. trainctx)')
+    ap.add_argument('--v6', action='store_true',
+                    help='формат OXN6: адаптивная степень по патчам + '
+                         'контекст (нужен ox_ctx.pt; --boost работает)')
     ap.add_argument('--ctx_hidden', type=int, default=CTX_HIDDEN,
                     help='ширина контекстной сети (trainctx)')
     a = ap.parse_args()
@@ -1835,7 +2013,9 @@ def main():
         from PIL import Image
         rgb = load_rgb(a.args[0])
         t0 = time.time()
-        if a.v5:
+        if a.v6:
+            blob = with_cpu_fallback(neuro_compress_v6, rgb, a.q, a.ckpt)
+        elif a.v5:
             blob = with_cpu_fallback(neuro_compress_v5, rgb, a.q, a.ckpt)
         elif a.adaptive:
             blob = with_cpu_fallback(neuro_compress_adaptive, rgb, a.q, a.ckpt)

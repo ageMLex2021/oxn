@@ -158,14 +158,15 @@ and run `update-mime-database ~/.local/share/mime`.)
 ```bash
 python3 ox_neuro.py c photo.jpg photo.oxh --q 100 --adaptive
 python3 ox_neuro.py c photo.jpg photo.oxh --q 75 --v5   # context model (needs ox_ctx.pt)
+python3 ox_neuro.py c photo.jpg photo.oxh --q 75 --v6   # adaptive + context (needs ox_ctx.pt)
 python3 ox_neuro.py d photo.oxh photo.jpg
 python3 ox_neuro.py bench photo.jpg        # vs JPEG table
 ```
 
-On branch `oxn5-context` there is also the experimental OXN5 format
-(context entropy model, −6…−19% size at the same PSNR; see
-`ARCHITECTURE.md` → "OXN5"). Train its context branch with
-`python3 ox_neuro.py trainctx --steps 40000 --data <images>`.
+On branch `oxn5-context` there are also the experimental OXN5/OXN6 formats
+(context entropy model, −6…−19% / −2…−15% size at the same PSNR vs
+OXN3/OXN4; see `ARCHITECTURE.md` → "OXN5/OXN6"). Train the context branch
+with `python3 ox_neuro.py trainctx --steps 40000 --data <images>`.
 
 ## Files
 
@@ -178,4 +179,4 @@ On branch `oxn5-context` there is also the experimental OXN5 format
 | `oxh_viewer.py` | .oxh viewer |
 | `ox_neuro.pt` | codec checkpoint |
 | `ox_boost.pt` | conv predictor for adaptive boost mode |
-| `ox_ctx.pt` | context entropy model for OXN5 (branch `oxn5-context`) |
+| `ox_ctx.pt` | context entropy model for OXN5/OXN6 (branch `oxn5-context`) |
