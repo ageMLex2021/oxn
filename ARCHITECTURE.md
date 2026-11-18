@@ -106,11 +106,17 @@ OXN1–OXN4 files decode exactly as before.
   `c in.png out.oxh --q 75 --v6` (`--boost` works). The rate ladder is
   stored as float16 and the ctx inputs (anchor latent, log s map) are
   derived from exactly those float16 values.
+- **OXN7** = ELIC-style channel groups (6,6,6,6) + checkerboard inside
+  each group, one shared ctx net (`ox_ctx7.pt`, unknown channels/positions
+  are zeroed — the zero pattern is deterministic on both ends):
+  `c in.png out.oxh --q 75 --v7`. Train: `trainctx --groups 6,6,6,6`.
 
 Measured on the Kodak holdout (kodim21–24, never trained on), identical
 PSNR: **OXN5 is 5.7–18.6% smaller than OXN3** (avg −11.9%, gain grows with
 quality); **OXN6 is 1.5–14.5% smaller than OXN4** (avg −9.5%, gain grows
-towards low bitrates). Decode is automatic by magic bytes. Bit-exactness
+towards low bitrates); **OXN7 is a further 3–16% smaller than OXN5**
+(−31% vs OXN3 at q92 — and its ctx net was still mid-training). Decode is
+automatic by magic bytes. Bit-exactness
 rules keeping the rANS stream in sync: the rate scaler is quantized
 (float32 in OXN5, float16 ladder in OXN6) before use, the context net is
 fed the *decoded* (clipped to ±256) anchor latent, and ctx runs CPU fp64

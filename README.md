@@ -159,6 +159,7 @@ and run `update-mime-database ~/.local/share/mime`.)
 python3 ox_neuro.py c photo.jpg photo.oxh --q 100 --adaptive
 python3 ox_neuro.py c photo.jpg photo.oxh --q 75 --v5   # context model (needs ox_ctx.pt)
 python3 ox_neuro.py c photo.jpg photo.oxh --q 75 --v6   # adaptive + context (needs ox_ctx.pt)
+python3 ox_neuro.py c photo.jpg photo.oxh --q 75 --v7   # channel groups + context (needs ox_ctx7.pt)
 python3 ox_neuro.py d photo.oxh photo.jpg
 python3 ox_neuro.py bench photo.jpg        # vs JPEG table
 ```
@@ -180,3 +181,5 @@ with `python3 ox_neuro.py trainctx --steps 40000 --data <images>`.
 | `ox_neuro.pt` | codec checkpoint |
 | `ox_boost.pt` | conv predictor for adaptive boost mode |
 | `ox_ctx.pt` | context entropy model for OXN5/OXN6 (branch `oxn5-context`) |
+| `ox_ctx7.pt` | channel-group context model for OXN7 (branch `oxn5-context`) |
+| `TASK_ARM64.md` | handoff: перенос обучения на arm64 (branch `oxn5-context`) |

@@ -121,7 +121,8 @@ def ms_ssim(x, y, k, weights=(0.0448, 0.2856, 0.3001, 0.2363, 0.1333)):
     v = torch.stack(mcs[:-1]).pow(w[:4, None]).prod(0) * mss.pow(w[4])
     return v.mean()
 def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
-                shared=False, moe=0, refine=False, hyper=False, window=0):
+                shared=False, moe=0, refine=False, hyper=False, window=0,
+                se=False):
     import torch
     import torch.nn as nn
 
@@ -158,6 +159,22 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
 
         def forward(self, w):
             return self.net(w)
+
+    class SEGate(nn.Module):
+        """Attention-маска на латенте (идея NLAM из NLAIC): сеть сама
+        решает, каким каналам какого токена дать вес — неявное распределение
+        бит по важности. Zero-init -> в точности тождественное отображение."""
+        def __init__(self, ch):
+            super().__init__()
+            h = max(8, ch * 2)
+            self.f1 = nn.Linear(ch, h)
+            self.f2 = nn.Linear(h, ch)
+            nn.init.zeros_(self.f2.weight)
+            nn.init.zeros_(self.f2.bias)
+
+        def forward(self, z):
+            return z * torch.sigmoid(self.f2(
+                torch.nn.functional.gelu(self.f1(z)))) * 2.0
 
     class RefineHead(nn.Module):
         """Свёрточная голова поверх unpatchify: сглаживает швы между
@@ -291,6 +308,10 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
             self.to_lat = nn.Linear(dim, latent)
             self.from_lat = nn.Linear(latent, dim)
             self.to_pix = nn.Linear(dim, patch * patch * 3)
+            self.se = se
+            if se:
+                self.se_enc = SEGate(latent)
+                self.se_dec = SEGate(latent)
             self.refine = RefineHead() if refine else None
             if hyper:
                 self.hyper_enc = HyperEnc()
@@ -342,11 +363,16 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
             else:
                 for i, b in enumerate(self.enc):
                     h = b(h, None, ht, wt, i % 2 == 1)
-            return _linc(self.to_lat, h)
+            z = _linc(self.to_lat, h)
+            if self.se:
+                z = self.se_enc(z)
+            return z
 
         def decode(self, z, H, W, logs=None):
             p = self.patch
             ht, wt = H // p, W // p
+            if self.se:
+                z = self.se_dec(z)
             h = _linc(self.from_lat, z)
             h = h + self.posemb(ht, wt).to(h.dtype)
             if logs is not None:
@@ -410,6 +436,71 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
     return OxFormer()
 
 
+# ---- совместный ретрен кодека с OXN7-энтропией (train --ctx7) -------------
+def _forward_ctx7(model, ctx7, xb, smap, groups):
+    """Дифференцируемый forward с полной OXN7-моделью битрейта: UNAQ-шум +
+    STE, rate = Лаплас (группа 0, якоря) + Гаусс от ctx7 (остальные проходы)
+    + гипер-латент. Возвращает (xr, bpp) в той же нормировке, что и
+    OxFormer.forward."""
+    import torch
+    B, _, H, W = xb.shape
+    p = model.patch
+    g = H // p
+    C = model.latent
+    T_ = g * g
+    z = model.encode(xb)
+    sm = smap.unsqueeze(-1)
+    zs = z * sm
+    zq = zs + (torch.round(zs) - zs).detach()                 # STE
+    grid = (zq / sm).transpose(1, 2).reshape(B, C, g, g)
+    ph, pw = (-g) % 4, (-g) % 4
+    gpad = torch.nn.functional.pad(grid, (0, pw, 0, ph), mode='replicate')
+    w = model.hyper_enc(gpad)
+    wq = w + (torch.round(w) - w).detach()
+    mb = model.hyper_dec(wq)[:, :, :g, :g]
+    mu_h, logb_h = mb.chunk(2, 1)
+    b_h = torch.nn.functional.softplus(logb_h) + 1e-2
+    anch = torch.from_numpy(_anchor_mask(g, g)).to(z.device)
+    anch = anch.reshape(1, 1, g, g)
+    nanch = ~anch
+    t = (zs + (torch.rand_like(zs) - 0.5)).transpose(1, 2).reshape(B, C, g, g)
+    bits = torch.zeros(B, g, g, device=z.device)
+    hi0 = groups[0]
+    # группа 0, якоря: Лаплас от hyperprior
+    bits = bits + anch * (((t[:, :hi0] - mu_h[:, :hi0]).abs()
+                           / (b_h[:, :hi0] * math.log(2)))
+                          + torch.log2(2 * b_h[:, :hi0])).sum(1)
+    qd = torch.zeros_like(grid)
+    qd[:, :hi0] = grid[:, :hi0] * anch
+    logs_ch = torch.log(smap).reshape(B, 1, g, g)
+    sq2 = math.sqrt(2.0)
+    for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+        for phase in (True, False):
+            pm = anch if phase else nanch
+            if gi == 0 and phase:
+                continue
+            feats = torch.cat([qd, mu_h, logb_h, logs_ch], 1)
+            dmu, lsig = ctx7(feats).chunk(2, 1)
+            mu = mu_h[:, lo:hi] + dmu[:, lo:hi]
+            sig = torch.nn.functional.softplus(lsig[:, lo:hi]) + 1e-2
+            tg = t[:, lo:hi]
+            cdf = 0.5 * (1 + torch.erf(
+                (torch.stack([tg + 0.5, tg - 0.5]) - mu) / (sig * sq2)))
+            prob = (cdf[0] - cdf[1]).clamp_min(1e-9)
+            bg = (-torch.log2(prob)).sum(1)                   # B x g x g
+            bits = bits + torch.where(pm, bg, torch.zeros_like(bg))
+            qd[:, lo:hi] = torch.where(pm, grid[:, lo:hi], qd[:, lo:hi])
+    bw = torch.nn.functional.softplus(model.log_bw) + 1e-3
+    bw = bw[None, :, None, None]
+    tw = w + (torch.rand_like(w) - 0.5)
+    bits_w = (tw.abs() / (bw * math.log(2))
+              + torch.log2(2 * bw)).sum(dim=(1, 2, 3))
+    bits = bits.reshape(B, T_) + (bits_w / T_).unsqueeze(1)
+    bpp = bits / (3 * p * p)
+    xr = model.decode(zq / sm, H, W, torch.log(smap))
+    return xr, bpp
+
+
 # ------------------------------------------------------------ обучение -----
 def cmd_train(args):
     import torch
@@ -431,7 +522,7 @@ def cmd_train(args):
     model = build_model(dim=args.dim, depth=args.depth, latent=args.latent,
                         shared=args.shared, moe=args.moe,
                         refine=args.refine, hyper=args.hyper,
-                        window=args.window).to(dev)
+                        window=args.window, se=args.se).to(dev)
     if args.init:
         ck = torch.load(args.init, map_location='cpu', weights_only=True)
         model.load_state_dict(ck['model'], strict=False)
@@ -445,9 +536,27 @@ def cmd_train(args):
         print(f'frozen encoder parameters: {n_frozen / 1e6:.2f}M')
     gk = _gauss_kernel().to(dev)
     sk = _sobel_kernel().to(dev)
+    ctx7 = None
+    groups7 = None
+    if args.ctx7:
+        if not os.path.exists(args.ctx_file):
+            sys.exit(f'--ctx7: нет {args.ctx_file} — сначала trainctx '
+                     f'--groups ...')
+        ck7 = torch.load(args.ctx_file, map_location='cpu', weights_only=True)
+        groups7 = tuple(int(v) for v in ck7['groups'])
+        if sum(groups7) != args.latent:
+            sys.exit(f'--ctx7: groups {groups7} не сходятся с '
+                     f'latent={args.latent}')
+        ctx7 = _build_ctx7(args.latent,
+                           int(ck7.get('hidden', CTX_HIDDEN))).to(dev)
+        ctx7.load_state_dict(ck7['state'])
+        print(f'ctx7 rate model: {args.ctx_file}, groups={groups7}')
+    params = list(model.parameters())
+    if ctx7 is not None:
+        params += list(ctx7.parameters())
     n_params = sum(p.numel() for p in model.parameters())
     print(f'parameters: {n_params / 1e6:.2f}M, device: {dev}')
-    opt = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-5)
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-5)
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
         opt, T_max=args.steps, eta_min=args.lr / 20)
     crop = args.crop
@@ -481,7 +590,10 @@ def cmd_train(args):
                 field.reshape(args.batch, T_).astype(np.float32)).to(dev)
         lam = 25.0 / (smap * smap)
         with torch.autocast('cuda', dtype=torch.bfloat16, enabled=(dev == 'cuda')):
-            xr, bpp = model(xb, smap)
+            if ctx7 is not None:
+                xr, bpp = _forward_ctx7(model, ctx7, xb, smap, groups7)
+            else:
+                xr, bpp = model(xb, smap)
             mse = torch.mean((xr - xb) ** 2)
             loss = args.w_mse * mse + (lam * bpp).mean()
             if args.w_msssim > 0:
@@ -510,14 +622,24 @@ def cmd_train(args):
                                  'depth': args.depth, 'latent': args.latent,
                                  'heads': HEADS, 'shared': args.shared,
                                  'moe': args.moe, 'refine': args.refine,
-                                 'hyper': args.hyper, 'window': args.window}},
+                                 'hyper': args.hyper, 'window': args.window,
+                                 'se': args.se}},
                         args.out + '.part')
+            if ctx7 is not None:
+                torch.save({'state': ctx7.state_dict(), 'latent': args.latent,
+                            'hidden': ctx7.net[0].out_channels,
+                            'groups': groups7}, args.ctx_file + '.part')
     torch.save({'model': model.state_dict(),
                 'arch': {'patch': PATCH, 'dim': args.dim, 'depth': args.depth,
                          'latent': args.latent, 'heads': HEADS,
                          'shared': args.shared, 'moe': args.moe,
                          'refine': args.refine, 'hyper': args.hyper,
-                         'window': args.window}}, args.out)
+                         'window': args.window, 'se': args.se}}, args.out)
+    if ctx7 is not None:
+        torch.save({'state': ctx7.state_dict(), 'latent': args.latent,
+                    'hidden': ctx7.net[0].out_channels,
+                    'groups': groups7}, args.ctx_file)
+        print(f'saved: {args.ctx_file}')
     print(f'saved: {args.out}  ({time.time() - t0:.0f} s)')
 
 
@@ -584,6 +706,7 @@ def _load(path=None):
     arch.setdefault('refine', False)
     arch.setdefault('hyper', False)
     arch.setdefault('window', 0)
+    arch.setdefault('se', False)
     model = build_model(**arch)
     model.load_state_dict(ck['model'], strict=False)  # старые чекпоинты без scale_emb
     model.__dict__['_ckpt_path'] = path
@@ -1662,6 +1785,180 @@ def _neuro_decompress_v6(blob, ckpt):
     return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+# ---- OXN7: канальный контекст (ELIC-style) --------------------------------
+# Каналы латента делятся на группы; самая информативная первая группа
+# (якоря) кодируется Лапласом от hyperprior, дальше каждая группа — Гауссом
+# от общей ctx-сети в два прохода: сначала якоря группы (контекст —
+# предыдущие группы целиком), потом не-якоря (+ якоря своей группы).
+# Неизвестное зануляется: паттерн нулей детерминирован порядком декодирования
+# и совпадает на обоих концах — маскированные свёртки не нужны.
+CTX7_FILE = os.path.join(HERE, 'ox_ctx7.pt')
+CTX7_GROUPS = (6, 6, 6, 6)
+_CTX7 = None
+
+
+def _build_ctx7(latent, hidden=CTX_HIDDEN):
+    import torch
+    import torch.nn as nn
+
+    class CtxNet7(nn.Module):
+        """латент с занулённым неизвестным (C) + hyper mu,logb (2C) +
+        log s (1) -> (dmu, log sig) по всем каналам (2C)."""
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Sequential(
+                nn.Conv2d(latent * 3 + 1, hidden, 5, padding=2), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 1), nn.GELU(),
+                nn.Conv2d(hidden, hidden, 1), nn.GELU(),
+                nn.Conv2d(hidden, latent * 2, 1))
+
+        def forward(self, x):
+            return self.net(x)
+
+    return CtxNet7()
+
+
+def _ctx7_net(latent, path=None):
+    """-> (net fp64 CPU, groups). Канон бит-точности, как у _ctx_net."""
+    global _CTX7
+    import torch
+    path = path or CTX7_FILE
+    if _CTX7 is None or _CTX7[0] != (path, latent):
+        if not os.path.exists(path):
+            sys.exit(f'no context model {path} — train first: python3 '
+                     f'ox_neuro.py trainctx --groups 6,6,6,6')
+        ck = torch.load(path, map_location='cpu', weights_only=True)
+        groups = tuple(int(v) for v in ck['groups'])
+        ctx = _build_ctx7(latent, int(ck.get('hidden', CTX_HIDDEN)))
+        ctx.load_state_dict(ck['state'])
+        ctx = ctx.to(torch.float64).eval()
+        _CTX7 = ((path, latent), ctx, groups)
+    if sum(_CTX7[2]) != latent:
+        sys.exit(f'{path}: groups {_CTX7[2]} не сходятся с latent={latent}')
+    return _CTX7[1], _CTX7[2]
+
+
+def _group_cuts(groups):
+    cuts = np.concatenate([[0], np.cumsum(groups)])
+    return [(int(cuts[i]), int(cuts[i + 1])) for i in range(len(groups))]
+
+
+def neuro_compress_v7(rgb, q=75, ckpt=None):
+    """OXN7: канальные группы (ELIC) + checkerboard внутри группы."""
+    import torch
+    model, dev = _load(ckpt)
+    if getattr(model, 'hyper_enc', None) is None:
+        sys.exit('OXN7 требует hyper-чекпоинт (--hyper при обучении кодека)')
+    p = model.patch
+    s = float(np.float32(q2s(q)))
+    H, W = rgb.shape[:2]
+    canvas, Hp, Wp = _pad_image(rgb, p)
+    ht, wt = Hp // p, Wp // p
+    x = torch.from_numpy(canvas).permute(2, 0, 1)[None]
+    if dev == 'cuda' and Hp * Wp > 16_000_000:
+        x = x.to(torch.bfloat16)
+    x = x.to(dev)
+    with torch.no_grad(), _maybe_autocast(dev, Hp * Wp):
+        z = model.encode(x)[0]
+    q_lat = np.round(z.float().cpu().numpy() * s).astype(np.int64)   # T x C
+    T_, C = q_lat.shape
+    zqd = torch.from_numpy((q_lat / s).astype(np.float32)).to(dev)
+    w, mu, logb = _hyper_mu_b(model, zqd, ht, wt, dev)
+    ctx, groups = _ctx7_net(C)
+    anch = _anchor_mask(ht, wt)
+    logs_map = np.full(T_, math.log(s))
+    mu_r = np.round(mu).astype(np.int64)
+    bids_l = _bucket_idx(logb)
+    qd = np.zeros((T_, C), np.int64)      # декодируемый латент по ходу проходов
+    streams = []
+    for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+        for phase in (True, False):       # True = якоря, False = не-якоря
+            pos = anch if phase else ~anch
+            if gi == 0 and phase:
+                # первая группа якорей: контекста нет — Лаплас от hyper
+                resid = (np.clip(q_lat - mu_r, -RES_RANGE, RES_RANGE - 1)
+                         + RES_RANGE)
+                streams.append(_enc_syms(resid[pos][:, lo:hi],
+                                         bids_l[pos][:, lo:hi]))
+                mu_ref = mu_r
+            else:
+                zg = (qd / s).astype(np.float64)
+                dmu, lsig = _ctx_params(ctx, zg, mu, logb, logs_map, ht, wt)
+                mu_nr = np.round(mu + dmu).astype(np.int64)
+                resid = (np.clip(q_lat - mu_nr, -RES_RANGE, RES_RANGE - 1)
+                         + RES_RANGE)
+                sig = np.log1p(np.exp(lsig)) + 1e-2
+                bids = N_BUCK + _bucket_idx(np.log(sig))
+                streams.append(_enc_syms(resid[pos][:, lo:hi],
+                                         bids[pos][:, lo:hi]))
+                mu_ref = mu_nr
+            # дальше в контекст идёт ДЕКОДИРУЕМАЯ версия (клиппинг ±256)
+            qd[pos, lo:hi] = (resid[pos][:, lo:hi] - RES_RANGE
+                              + mu_ref[pos][:, lo:hi])
+    wblob = _encode_flat(w)
+    HC = w.shape[1]
+    out = bytearray(b'OXN7')
+    out += struct.pack('<HHfBBH', H, W, s, p, C, HC)
+    out += struct.pack('<B', len(groups))
+    for gs in groups:
+        out += struct.pack('<B', gs)
+    out += struct.pack('<I', len(wblob)) + wblob
+    for blob in streams:
+        out += struct.pack('<I', len(blob)) + blob
+    return bytes(out)
+
+
+def _neuro_decompress_v7(blob, ckpt):
+    import torch
+    H, W, s, p, C, HC = struct.unpack('<HHfBBH', blob[4:16])
+    (G,) = struct.unpack('<B', blob[16:17])
+    groups = tuple(struct.unpack(f'<{G}B', blob[17:17 + G]))
+    pos = 17 + G
+    model, dev = _load(ckpt)
+    ctx, ck_groups = _ctx7_net(C)
+    if ck_groups != groups:
+        sys.exit(f'ox_ctx7.pt: groups {ck_groups}, в файле {groups}')
+    Hp = (H + p - 1) // p * p
+    Wp = (W + p - 1) // p * p
+    ht, wt = Hp // p, Wp // p
+    T_ = ht * wt
+    ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
+    (wlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    w = _decode_flat(blob[pos:pos + wlen], ht4 * wt4 * HC).reshape(ht4 * wt4, HC)
+    pos += wlen
+    mu, logb = _hyper_raw_from_w(model, w, ht, wt)
+    anch = _anchor_mask(ht, wt)
+    logs_map = np.full(T_, math.log(s))
+    mu_r = np.round(mu).astype(np.int64)
+    bids_l = _bucket_idx(logb)
+    qd = np.zeros((T_, C), np.int64)
+    for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+        for phase in (True, False):
+            posm = anch if phase else ~anch
+            (slen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+            if gi == 0 and phase:
+                resid = _dec_syms(blob[pos:pos + slen],
+                                  bids_l[posm][:, lo:hi])
+                mu_ref = mu_r
+            else:
+                zg = (qd / s).astype(np.float64)
+                dmu, lsig = _ctx_params(ctx, zg, mu, logb, logs_map, ht, wt)
+                mu_nr = np.round(mu + dmu).astype(np.int64)
+                sig = np.log1p(np.exp(lsig)) + 1e-2
+                bids = N_BUCK + _bucket_idx(np.log(sig))
+                resid = _dec_syms(blob[pos:pos + slen],
+                                  bids[posm][:, lo:hi])
+                mu_ref = mu_nr
+            pos += slen
+            qd[posm, lo:hi] = (resid.reshape(int(posm.sum()), hi - lo)
+                               - RES_RANGE + mu_ref[posm][:, lo:hi])
+    zq = (qd / s).astype(np.float32)
+    z = torch.from_numpy(zq)[None].to(dev)
+    lg = torch.full((1, T_), math.log(s), device=dev)
+    xr = _run_decode(model, z, Hp, Wp, lg, dev)
+    return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
 def cmd_trainctx(args):
     """Обучение контекстной ветки OXN5/OXN6: энкодер и hyperprior
     заморожены, минимизируется энтропия не-якорных токенов под дискретным
@@ -1679,7 +1976,16 @@ def cmd_trainctx(args):
     anch_np = _anchor_mask(g, g)
     anch = torch.from_numpy(anch_np).to(dev)
     nanch = torch.from_numpy(~anch_np).to(dev)
-    ctx = _build_ctx(C, args.ctx_hidden).to(dev)
+    groups = None
+    if args.groups:
+        groups = tuple(int(v) for v in args.groups.split(','))
+        if sum(groups) != C:
+            sys.exit(f'--groups {groups} не сходятся с latent={C}')
+        ctx = _build_ctx7(C, args.ctx_hidden).to(dev)
+        out_file = CTX7_FILE
+    else:
+        ctx = _build_ctx(C, args.ctx_hidden).to(dev)
+        out_file = CTX_FILE
     if args.init and os.path.exists(args.init):
         ck = torch.load(args.init, map_location='cpu', weights_only=True)
         ctx.load_state_dict(ck['state'])
@@ -1740,17 +2046,49 @@ def cmd_trainctx(args):
             w = torch.round(model.hyper_enc(grid))
             mu_h, logb_h = model.hyper_dec(w).chunk(2, 1)     # B x C x g x g
         zg = grid * anch.reshape(1, 1, g, g)                  # не-якоря = 0
-        feats = torch.cat([zg, mu_h, logb_h,
-                           torch.log(smap).reshape(args.batch, 1, g, g)], 1)
-        dmu, lsig = ctx(feats).chunk(2, 1)
-        mu = mu_h + dmu
-        sig = torch.nn.functional.softplus(lsig) + 1e-2
-        qg = q_lat.transpose(1, 2).reshape(args.batch, C, g, g)
-        cdf = 0.5 * (1 + torch.erf(
-            (torch.stack([qg + 0.5, qg - 0.5]) - mu) / (sig * sq2)))
-        prob = (cdf[0] - cdf[1]).clamp_min(1e-9)
-        bits = -torch.log2(prob)                              # B x C x g x g
-        loss = (bits * msel).sum() / (msel.sum() * args.batch)
+        if groups is None:
+            feats = torch.cat([zg, mu_h, logb_h,
+                               torch.log(smap).reshape(args.batch, 1, g, g)], 1)
+            dmu, lsig = ctx(feats).chunk(2, 1)
+            mu = mu_h + dmu
+            sig = torch.nn.functional.softplus(lsig) + 1e-2
+            qg = q_lat.transpose(1, 2).reshape(args.batch, C, g, g)
+            cdf = 0.5 * (1 + torch.erf(
+                (torch.stack([qg + 0.5, qg - 0.5]) - mu) / (sig * sq2)))
+            prob = (cdf[0] - cdf[1]).clamp_min(1e-9)
+            bits = -torch.log2(prob)                          # B x C x g x g
+            loss = (bits * msel).sum() / (msel.sum() * args.batch)
+        else:
+            # OXN7: проходы по группам и фазам, как при декодировании;
+            # известное подставляем учительски (истинные q/s), неизвестное — 0
+            qg = q_lat.transpose(1, 2).reshape(args.batch, C, g, g)
+            amap = anch.reshape(1, 1, g, g)
+            nmap = nanch.reshape(1, 1, g, g)
+            logs_ch = torch.log(smap).reshape(args.batch, 1, g, g)
+            qd = torch.zeros_like(grid)
+            loss = 0.0
+            npass = 0
+            for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+                for phase in (True, False):
+                    pm = amap if phase else nmap
+                    if gi == 0 and phase:
+                        qd[:, lo:hi] = grid[:, lo:hi] * pm
+                        continue
+                    feats = torch.cat([qd, mu_h, logb_h, logs_ch], 1)
+                    dmu, lsig = ctx(feats).chunk(2, 1)
+                    mu = mu_h[:, lo:hi] + dmu[:, lo:hi]
+                    sig = torch.nn.functional.softplus(lsig[:, lo:hi]) + 1e-2
+                    qt = qg[:, lo:hi]
+                    cdf = 0.5 * (1 + torch.erf(
+                        (torch.stack([qt + 0.5, qt - 0.5]) - mu) / (sig * sq2)))
+                    prob = (cdf[0] - cdf[1]).clamp_min(1e-9)
+                    bits = -torch.log2(prob)                  # B x gc x g x g
+                    pmf = pm.float()
+                    loss = loss + (bits * pmf).sum() / (pmf.sum() * args.batch)
+                    npass += 1
+                    qd[:, lo:hi] = torch.where(pm, grid[:, lo:hi],
+                                               qd[:, lo:hi])
+            loss = loss / npass
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(ctx.parameters(), 1.0)
@@ -1767,10 +2105,11 @@ def cmd_trainctx(args):
                   f'(s~{smap.mean().item():.2f})  ({time.time() - t0:.0f} с)')
         if step % 2000 == 0:
             torch.save({'state': ctx.state_dict(), 'latent': C,
-                        'hidden': args.ctx_hidden}, CTX_FILE + '.part')
+                        'hidden': args.ctx_hidden,
+                        'groups': groups}, out_file + '.part')
     torch.save({'state': ctx.state_dict(), 'latent': C,
-                'hidden': args.ctx_hidden}, CTX_FILE)
-    print(f'saved: {CTX_FILE}  ({time.time() - t0:.0f} s)')
+                'hidden': args.ctx_hidden, 'groups': groups}, out_file)
+    print(f'saved: {out_file}  ({time.time() - t0:.0f} s)')
 
 
 def neuro_compress_adaptive(rgb, q=75, ckpt=None):
@@ -1857,7 +2196,7 @@ def neuro_decompress(blob, ckpt=None):
     import torch
     magic = blob[:4]
     # hyper-форматы требуют hyper-модель; если выбранная без неё — ищем подходящую
-    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6'):
+    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7'):
         model, _ = _load(ckpt)
         if getattr(model, 'hyper_enc', None) is None:
             for alt in ('ox_neuro_v10.pt', 'ox_neuro_v9.pt'):
@@ -1865,6 +2204,8 @@ def neuro_decompress(blob, ckpt=None):
                 if os.path.exists(p):
                     ckpt = p
                     break
+    if magic == b'OXN7':
+        return _neuro_decompress_v7(blob, ckpt)
     if magic == b'OXN6':
         return _neuro_decompress_v6(blob, ckpt)
     if magic == b'OXN5':
@@ -1928,6 +2269,12 @@ def cmd_bench(args):
             rec = neuro_decompress(blob, args.ckpt)
             print(f'{"OXN6-адапт q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
                   f'{psnr(rgb, rec):7.2f}')
+    if os.path.exists(CTX7_FILE):
+        for q in (5, 15, 30, 50, 75, 92):
+            blob = neuro_compress_v7(rgb, q, args.ckpt)
+            rec = neuro_decompress(blob, args.ckpt)
+            print(f'{"OXN7-кан q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
+                  f'{psnr(rgb, rec):7.2f}')
 
 
 def main():
@@ -1953,6 +2300,13 @@ def main():
                     help='windowed attention, N x N tokens (0 = global)')
     ap.add_argument('--refine', action='store_true',
                     help='conv refinement head against patch seams')
+    ap.add_argument('--se', action='store_true',
+                    help='SE-гейты на латенте (attention-маски NLAM)')
+    ap.add_argument('--ctx7', action='store_true',
+                    help='train: совместный ретрен с OXN7-энтропией в лоссе '
+                         '(нужен обученный ox_ctx7.pt)')
+    ap.add_argument('--ctx_file', default=CTX7_FILE,
+                    help='train --ctx7: файл контекстной сети (in/out)')
     ap.add_argument('--w_hp', type=float, default=0.0,
                     help='high-pass loss weight (Sobel, sharpness)')
     ap.add_argument('--init', default=None, help='checkpoint to fine-tune from')
@@ -1977,6 +2331,11 @@ def main():
     ap.add_argument('--v6', action='store_true',
                     help='формат OXN6: адаптивная степень по патчам + '
                          'контекст (нужен ox_ctx.pt; --boost работает)')
+    ap.add_argument('--v7', action='store_true',
+                    help='формат OXN7: канальные группы (ELIC) + контекст '
+                         '(нужен ox_ctx7.pt, см. trainctx --groups)')
+    ap.add_argument('--groups', default='',
+                    help='trainctx: канальные группы для OXN7, напр. 6,6,6,6')
     ap.add_argument('--ctx_hidden', type=int, default=CTX_HIDDEN,
                     help='ширина контекстной сети (trainctx)')
     a = ap.parse_args()
@@ -2013,7 +2372,9 @@ def main():
         from PIL import Image
         rgb = load_rgb(a.args[0])
         t0 = time.time()
-        if a.v6:
+        if a.v7:
+            blob = with_cpu_fallback(neuro_compress_v7, rgb, a.q, a.ckpt)
+        elif a.v6:
             blob = with_cpu_fallback(neuro_compress_v6, rgb, a.q, a.ckpt)
         elif a.v5:
             blob = with_cpu_fallback(neuro_compress_v5, rgb, a.q, a.ckpt)
