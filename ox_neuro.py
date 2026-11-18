@@ -645,11 +645,14 @@ OX_BIN = os.path.join(HERE, 'ox')
 
 
 def _prans_tables_file(td):
-    """Все бакет-таблицы в бинарник: [u32 K][K x 513 x u32 cum LE]."""
-    tabs = np.stack([_lap_table(i) for i in range(N_BUCK)])
+    """Все бакет-таблицы в бинарник: [u32 K][K x 513 x u32 cum LE].
+    Бакеты 0..23 — Лаплас (OXN3/4 + якоря OXN5), 24..47 — Гаусс (контекст
+    OXN5); C-ускоритель читает K из файла, менять его не нужно."""
+    tabs = np.stack([_lap_table(i) for i in range(N_BUCK)]
+                    + [_gauss_table(i) for i in range(N_BUCK)])
     path = os.path.join(td, 'tables.bin')
     with open(path, 'wb') as f:
-        f.write(struct.pack('<I', N_BUCK))
+        f.write(struct.pack('<I', 2 * N_BUCK))
         f.write(tabs.astype('<u4').tobytes())
     return path
 
@@ -734,6 +737,33 @@ def _lap_table(idx):
     _TABLES[idx] = cum
     return cum
 
+def _gauss_table(idx):
+    """cum-таблица дискретного Гаусса N(0, sigma_бакета) над 512 символами
+    остатка (контекстный поток OXN5, бакеты N_BUCK..2*N_BUCK-1)."""
+    key = ('g', idx)
+    cum = _TABLES.get(key)
+    if cum is not None:
+        return cum
+    sig = _bucket_center(idx)
+    d = np.arange(-RES_RANGE, RES_RANGE)
+    p = np.exp(-(d * d) / (2.0 * sig * sig))
+    f = np.maximum(1, np.round(p / p.sum() * RT).astype(np.int64))
+    diff = int(RT - f.sum())
+    order = np.argsort(-f)
+    k = 0
+    while diff:
+        i = order[k % len(order)]
+        if diff > 0:   f[i] += 1; diff -= 1
+        elif f[i] > 1: f[i] -= 1; diff += 1
+        k += 1
+    cum = np.zeros(513, np.uint32)
+    np.cumsum(f, out=cum[1:])
+    _TABLES[key] = cum
+    return cum
+
+def _table_for(bid):
+    return _lap_table(bid) if bid < N_BUCK else _gauss_table(bid - N_BUCK)
+
 def rans_enc_param(symbols, bids):
     fast = rans_enc_param_fast(symbols, bids)
     if fast is not None:
@@ -741,7 +771,7 @@ def rans_enc_param(symbols, bids):
     x = RL
     out = bytearray()
     for i in range(len(symbols) - 1, -1, -1):
-        cum = _lap_table(int(bids[i]))
+        cum = _table_for(int(bids[i]))
         s = int(symbols[i])
         f = int(cum[s + 1] - cum[s]); c = int(cum[s])
         x_max = ((RL >> RSCALE) << 8) * f
@@ -762,7 +792,7 @@ def rans_dec_param(blob, bids):
     pos = 4
     res = np.empty(len(bids), np.int32)
     for i in range(len(bids)):
-        cum = _lap_table(int(bids[i]))
+        cum = _table_for(int(bids[i]))
         slot = x & (RT - 1)
         s = int(np.searchsorted(cum, slot, 'right') - 1)
         res[i] = s
@@ -1249,7 +1279,334 @@ def _neuro_decompress_v4(blob, ckpt):
     return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+# ---- OXN5: контекстная энтропийная модель --------------------------------
+# Идея NLAIC (arXiv 1910.06244) и последующих работ: вероятность латента
+# зависит не только от hyperprior, но и от уже декодированных соседей.
+# Контекст — checkerboard (He et al., 2021): токены с чётной суммой индексов
+# (i+j)%2==0 («якоря») кодируются первым потоком по Лапласу от hyperprior;
+# нечётные — вторым потоком по Гауссу (mu, sigma) от маленькой conv-сети,
+# которая видит ТОЛЬКО якоря (маскированная свёртка 5x5 + 1x1). Декод —
+# два параллельных прохода вместо попиксельной авторегрессии.
+CTX_FILE = os.path.join(HERE, 'ox_ctx.pt')
+CTX_HIDDEN = 64
+_CTX = None
+
+
+def _build_ctx(latent, hidden=CTX_HIDDEN):
+    import torch
+    import torch.nn as nn
+
+    class MaskedConv(nn.Conv2d):
+        """Свёртка, читающая только якорные позиции: маска зануляет веса
+        на чётных (di+dj) — на checkerboard-раскраске это всегда ещё
+        неизвестные соседи (включая центр)."""
+        def __init__(self, cin, cout, k=5):
+            super().__init__(cin, cout, k, padding=k // 2)
+            m = torch.zeros(1, 1, k, k)
+            for di in range(k):
+                for dj in range(k):
+                    if (di + dj) % 2 == 1:
+                        m[0, 0, di, dj] = 1.0
+            self.register_buffer('m', m)
+
+        def forward(self, x):
+            return self._conv_forward(x, self.weight * self.m, self.bias)
+
+    class CtxNet(nn.Module):
+        """якоря (C) + hyper (mu, logb = 2C) + log s (1) -> (dmu, log sig)."""
+        def __init__(self):
+            super().__init__()
+            self.c1 = MaskedConv(latent * 3 + 1, hidden)
+            self.c2 = nn.Conv2d(hidden, hidden, 1)
+            self.c3 = nn.Conv2d(hidden, latent * 2, 1)
+
+        def forward(self, x):
+            h = torch.nn.functional.gelu(self.c1(x))
+            h = torch.nn.functional.gelu(self.c2(h))
+            return self.c3(h)
+
+    return CtxNet()
+
+
+def _ctx_net(latent, path=None):
+    """Контекстная сеть на CPU fp64 — канон бит-точности, как у hyperprior
+    (mu/sigma задают таблицы энтропии и обязаны совпадать у кодека)."""
+    global _CTX
+    import torch
+    path = path or CTX_FILE
+    if _CTX is None or _CTX[0] != (path, latent):
+        if not os.path.exists(path):
+            sys.exit(f'no context model {path} — train first: '
+                     f'python3 ox_neuro.py trainctx')
+        ck = torch.load(path, map_location='cpu', weights_only=True)
+        ctx = _build_ctx(latent, int(ck.get('hidden', CTX_HIDDEN)))
+        ctx.load_state_dict(ck['state'])
+        ctx = ctx.to(torch.float64).eval()
+        _CTX = ((path, latent), ctx)
+    return _CTX[1]
+
+
+def _anchor_mask(ht, wt):
+    """(T,) bool row-major: True = якорь ((i+j) чётное)."""
+    ii, jj = np.meshgrid(np.arange(ht), np.arange(wt), indexing='ij')
+    return ((ii + jj) % 2 == 0).reshape(-1)
+
+
+def _ctx_params(ctx, zg, mu, logb, logs, ht, wt):
+    """zg: (T, C) латент с занулёнными не-якорями; mu, logb: (T, C) от
+    hyperprior -> dmu, log_sig (T, C) fp64 для всех токенов (используются
+    только не-якорные). CPU fp64, mkldnn off — канон, как _hyper_mu_b."""
+    import torch
+    C = zg.shape[1]
+    feats = np.concatenate([
+        zg.T.reshape(1, C, ht, wt),
+        mu.T.reshape(1, C, ht, wt),
+        logb.T.reshape(1, C, ht, wt),
+        np.full((1, 1, ht, wt), logs, np.float64)], axis=1)
+    mkldnn_on = torch.backends.mkldnn.enabled
+    torch.backends.mkldnn.enabled = False
+    try:
+        with torch.no_grad():
+            out = ctx(torch.from_numpy(feats))
+    finally:
+        torch.backends.mkldnn.enabled = mkldnn_on
+    dmu, lsig = out[0].chunk(2, 0)
+    return dmu.reshape(C, -1).T.numpy(), lsig.reshape(C, -1).T.numpy()
+
+
+def _enc_syms(resid, bids):
+    """Один параметрический rANS-поток; пустой -> b'' (тривиальный декод)."""
+    r = resid.reshape(-1).astype(np.int32)
+    b = np.ascontiguousarray(bids.reshape(-1))
+    if len(r) == 0:
+        return b''
+    blob = rans_enc_param(r, b)
+    if _VERIFY:
+        back, used = rans_dec_param(blob, b)
+        if used != len(blob) or not np.array_equal(back, r):
+            raise RuntimeError('internal: entropy stream failed self-check')
+    return blob
+
+
+def _dec_syms(blob, bids):
+    """Обратно к _enc_syms; контроль целостности по consumed == len(blob)."""
+    b = np.ascontiguousarray(bids.reshape(-1))
+    if len(b) == 0:
+        return np.empty(0, np.int32)
+    syms, used = rans_dec_param(blob, b)
+    if used != len(blob):
+        raise RuntimeError(
+            f'corrupt .oxh: entropy stream desync (read {used} of {len(blob)})')
+    return syms
+
+
+def neuro_compress_v5(rgb, q=75, ckpt=None):
+    """OXN5: hyperprior (якоря, Лаплас) + checkerboard-контекст (Гаусс)."""
+    import torch
+    model, dev = _load(ckpt)
+    if getattr(model, 'hyper_enc', None) is None:
+        sys.exit('OXN5 требует hyper-чекпоинт (--hyper при обучении кодека)')
+    p = model.patch
+    # s квантуется в float32 ДО квантизации латента: в заголовок уйдёт ровно
+    # это значение, и контекстная сеть (fp64) получит на обоих концах
+    # бит-идентичные zg и log s — иначе ulp-разница ломает rANS-поток
+    s = float(np.float32(q2s(q)))
+    H, W = rgb.shape[:2]
+    canvas, Hp, Wp = _pad_image(rgb, p)
+    ht, wt = Hp // p, Wp // p
+    x = torch.from_numpy(canvas).permute(2, 0, 1)[None]
+    if dev == 'cuda' and Hp * Wp > 16_000_000:
+        x = x.to(torch.bfloat16)
+    x = x.to(dev)
+    with torch.no_grad(), _maybe_autocast(dev, Hp * Wp):
+        z = model.encode(x)[0]
+    q_lat = np.round(z.float().cpu().numpy() * s).astype(np.int64)   # T x C
+    T_, C = q_lat.shape
+    zqd = torch.from_numpy((q_lat / s).astype(np.float32)).to(dev)
+    w, mu, logb = _hyper_mu_b(model, zqd, ht, wt, dev)
+    anch = _anchor_mask(ht, wt)
+    # якоря: Лаплас от hyperprior (бакеты 0..23)
+    mu_r = np.round(mu).astype(np.int64)
+    resid = np.clip(q_lat - mu_r, -RES_RANGE, RES_RANGE - 1) + RES_RANGE
+    ablob = _enc_syms(resid[anch], _bucket_idx(logb)[anch])
+    # не-якоря: Гаусс от контекстной сети (бакеты 24..47)
+    # ВАЖНО: в контекст идёт не истинный q_lat, а его ДЕКОДИРУЕМАЯ версия
+    # (resid зажат в ±256 — иначе при больших s клиппинг разводит энкодер
+    # и декодер, и поток не-якорей десинхронизируется)
+    zg = np.zeros((T_, C), np.float64)
+    zg[anch] = (resid[anch] - RES_RANGE + mu_r[anch]) / s
+    ctx = _ctx_net(C)
+    dmu, lsig = _ctx_params(ctx, zg, mu, logb, math.log(s), ht, wt)
+    mu_nr = np.round(mu + dmu).astype(np.int64)
+    resid_n = np.clip(q_lat - mu_nr, -RES_RANGE, RES_RANGE - 1) + RES_RANGE
+    sig = np.log1p(np.exp(lsig)) + 1e-2
+    nblob = _enc_syms(resid_n[~anch], N_BUCK + _bucket_idx(np.log(sig))[~anch])
+    wblob = _encode_flat(w)
+    HC = w.shape[1]
+    out = bytearray(b'OXN5')
+    out += struct.pack('<HHfBBH', H, W, s, p, C, HC)
+    out += struct.pack('<I', len(wblob)) + wblob
+    out += struct.pack('<I', len(ablob)) + ablob
+    out += struct.pack('<I', len(nblob)) + nblob
+    return bytes(out)
+
+
+def _hyper_raw_from_w(model, w, ht, wt):
+    """Сырые (mu, logb) гипердекодера из w — CPU fp64, mkldnn off (канон)."""
+    import torch
+    HC = w.shape[1]
+    ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
+    _, dec = _hyper_pair(model, 'cpu')
+    grid = torch.from_numpy(w.astype(np.float32)).to('cpu', torch.float64)
+    grid = grid.transpose(0, 1).reshape(1, HC, ht4, wt4)
+    mkldnn_on = torch.backends.mkldnn.enabled
+    torch.backends.mkldnn.enabled = False
+    try:
+        with torch.no_grad():
+            mb = dec(grid)
+    finally:
+        torch.backends.mkldnn.enabled = mkldnn_on
+    mb = mb[:, :, :ht, :wt].reshape(1, 2 * model.latent, -1)[0].transpose(0, 1)
+    mu, logb = mb.chunk(2, -1)
+    return mu.numpy(), logb.numpy()
+
+
+def _neuro_decompress_v5(blob, ckpt):
+    import torch
+    H, W, s, p, C, HC = struct.unpack('<HHfBBH', blob[4:16])
+    model, dev = _load(ckpt)
+    Hp = (H + p - 1) // p * p
+    Wp = (W + p - 1) // p * p
+    ht, wt = Hp // p, Wp // p
+    T_ = ht * wt
+    ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
+    pos = 16
+    (wlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    w = _decode_flat(blob[pos:pos + wlen], ht4 * wt4 * HC).reshape(ht4 * wt4, HC)
+    pos += wlen
+    mu, logb = _hyper_raw_from_w(model, w, ht, wt)
+    anch = _anchor_mask(ht, wt)
+    na, nn_ = int(anch.sum()), T_ - int(anch.sum())
+    (alen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    resid_a = _dec_syms(blob[pos:pos + alen], _bucket_idx(logb)[anch])
+    pos += alen
+    q_lat = np.zeros((T_, C), np.int64)
+    q_lat[anch] = resid_a.reshape(na, C) - RES_RANGE + np.round(mu[anch])
+    zg = np.zeros((T_, C), np.float64)
+    zg[anch] = q_lat[anch] / s
+    ctx = _ctx_net(C)
+    dmu, lsig = _ctx_params(ctx, zg, mu, logb, math.log(s), ht, wt)
+    sig = np.log1p(np.exp(lsig)) + 1e-2
+    bids_n = (N_BUCK + _bucket_idx(np.log(sig)))[~anch]
+    (nlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    resid_n = _dec_syms(blob[pos:pos + nlen], bids_n)
+    q_lat[~anch] = (resid_n.reshape(nn_, C) - RES_RANGE
+                    + np.round(mu + dmu)[~anch])
+    zq = (q_lat / s).astype(np.float32)
+    z = torch.from_numpy(zq)[None].to(dev)
+    lg = torch.full((1, T_), math.log(s), device=dev)
+    xr = _run_decode(model, z, Hp, Wp, lg, dev)
+    return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def cmd_trainctx(args):
+    """Обучение контекстной ветки OXN5: энкодер и hyperprior заморожены,
+    минимизируется энтропия не-якорных токенов под дискретным Гауссом."""
+    import torch
+    model, dev = _load(args.ckpt)
+    if getattr(model, 'hyper_enc', None) is None:
+        sys.exit('trainctx требует hyper-чекпоинт (--hyper при обучении)')
+    for prm in model.parameters():
+        prm.requires_grad_(False)
+    C = model.latent
+    p = model.patch
+    crop = args.crop
+    g = crop // p                                # токенов по стороне кропа
+    anch_np = _anchor_mask(g, g)
+    anch = torch.from_numpy(anch_np).to(dev)
+    nanch = torch.from_numpy(~anch_np).to(dev)
+    ctx = _build_ctx(C, args.ctx_hidden).to(dev)
+    if args.init and os.path.exists(args.init):
+        ck = torch.load(args.init, map_location='cpu', weights_only=True)
+        ctx.load_state_dict(ck['state'])
+        print(f'init ctx from {args.init}')
+    n_params = sum(prm.numel() for prm in ctx.parameters())
+    print(f'ctx parameters: {n_params / 1e3:.0f}K, device: {dev}')
+    exts = ('.png', '.jpg', '.jpeg')
+    files = [os.path.join(args.data, f) for f in sorted(os.listdir(args.data))
+             if f.lower().endswith(exts)]
+    # в памяти держим только кропы uint8: полные кадры DIV2K не влезают в RAM
+    crops = []
+    for f in files:
+        a = load_rgb(f)
+        H, W = a.shape[:2]
+        if H < crop or W < crop:
+            continue
+        for _ in range(2):
+            y = np.random.randint(0, H - crop + 1)
+            x = np.random.randint(0, W - crop + 1)
+            crops.append(torch.from_numpy(a[y:y + crop, x:x + crop].copy()))
+    print(f'trainctx: {len(crops)} crops ({crop}px) from '
+          f'{len(files)} images in {args.data}')
+    opt = torch.optim.AdamW(ctx.parameters(), lr=args.lr, weight_decay=1e-5)
+    sched = torch.optim.lr_scheduler.CosineAnnealingLR(
+        opt, T_max=args.steps, eta_min=args.lr / 20)
+    sq2 = math.sqrt(2.0)
+    msel = nanch.reshape(1, 1, g, g)
+    t0 = time.time()
+    for step in range(1, args.steps + 1):
+        idx = np.random.randint(0, len(crops), size=args.batch)
+        xs = []
+        for i in idx:
+            c = crops[i]
+            if np.random.rand() < 0.5:
+                c = torch.flip(c, dims=[1])
+            xs.append(c)
+        xb = (torch.stack(xs).to(dev, non_blocking=True)
+              .permute(0, 3, 1, 2).float() / 255.0)
+        s0 = math.exp(np.random.uniform(math.log(S_MIN), math.log(S_MAX)))
+        with torch.no_grad():
+            z = model.encode(xb)                              # B x T x C
+            q_lat = torch.round(z * s0)
+            grid = (q_lat / s0).transpose(1, 2).reshape(args.batch, C, g, g)
+            w = torch.round(model.hyper_enc(grid))
+            mu_h, logb_h = model.hyper_dec(w).chunk(2, 1)     # B x C x g x g
+        zg = grid * anch.reshape(1, 1, g, g)                  # не-якоря = 0
+        feats = torch.cat([zg, mu_h, logb_h,
+                           torch.full_like(mu_h[:, :1], math.log(s0))], 1)
+        dmu, lsig = ctx(feats).chunk(2, 1)
+        mu = mu_h + dmu
+        sig = torch.nn.functional.softplus(lsig) + 1e-2
+        qg = q_lat.transpose(1, 2).reshape(args.batch, C, g, g)
+        cdf = 0.5 * (1 + torch.erf(
+            (torch.stack([qg + 0.5, qg - 0.5]) - mu) / (sig * sq2)))
+        prob = (cdf[0] - cdf[1]).clamp_min(1e-9)
+        bits = -torch.log2(prob)                              # B x C x g x g
+        loss = (bits * msel).sum() / (msel.sum() * args.batch)
+        opt.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(ctx.parameters(), 1.0)
+        opt.step()
+        sched.step()
+        if step % 100 == 0 or step == 1:
+            with torch.no_grad():
+                b_h = torch.nn.functional.softplus(logb_h) + 1e-2
+                bits_h = ((qg - mu_h).abs() / (b_h * math.log(2))
+                          + torch.log2(2 * b_h))
+                bh = (bits_h * msel).sum() / (msel.sum() * args.batch)
+            print(f'  step {step:5d}/{args.steps}  '
+                  f'bits/ctx-tok {loss.item():.3f}  hyper-only {bh.item():.3f} '
+                  f'(s={s0:.2f})  ({time.time() - t0:.0f} с)')
+        if step % 2000 == 0:
+            torch.save({'state': ctx.state_dict(), 'latent': C,
+                        'hidden': args.ctx_hidden}, CTX_FILE + '.part')
+    torch.save({'state': ctx.state_dict(), 'latent': C,
+                'hidden': args.ctx_hidden}, CTX_FILE)
+    print(f'saved: {CTX_FILE}  ({time.time() - t0:.0f} s)')
+
+
 def neuro_compress_adaptive(rgb, q=75, ckpt=None):
+
     """Адаптивная степень сжатия по патчам. rgb: uint8 HxWx3 -> bytes .oxn"""
     import torch
     model, dev = _load(ckpt)
@@ -1332,7 +1689,7 @@ def neuro_decompress(blob, ckpt=None):
     import torch
     magic = blob[:4]
     # hyper-форматы требуют hyper-модель; если выбранная без неё — ищем подходящую
-    if magic in (b'OXN3', b'OXN4'):
+    if magic in (b'OXN3', b'OXN4', b'OXN5'):
         model, _ = _load(ckpt)
         if getattr(model, 'hyper_enc', None) is None:
             for alt in ('ox_neuro_v10.pt', 'ox_neuro_v9.pt'):
@@ -1340,6 +1697,8 @@ def neuro_decompress(blob, ckpt=None):
                 if os.path.exists(p):
                     ckpt = p
                     break
+    if magic == b'OXN5':
+        return _neuro_decompress_v5(blob, ckpt)
     if magic == b'OXN4':
         return _neuro_decompress_v4(blob, ckpt)
     if magic == b'OXN3':
@@ -1388,11 +1747,17 @@ def cmd_bench(args):
         rec = neuro_decompress(blob, args.ckpt)
         print(f'{"OXN-адапт q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
               f'{psnr(rgb, rec):7.2f}')
+    if os.path.exists(CTX_FILE):
+        for q in (5, 15, 30, 50, 75, 92):
+            blob = neuro_compress_v5(rgb, q, args.ckpt)
+            rec = neuro_decompress(blob, args.ckpt)
+            print(f'{"OXN5-ctx q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
+                  f'{psnr(rgb, rec):7.2f}')
 
 
 def main():
     ap = argparse.ArgumentParser(description='OX-Neuro — learned image codec')
-    ap.add_argument('cmd', choices=['train', 'c', 'd', 'bench'])
+    ap.add_argument('cmd', choices=['train', 'trainctx', 'c', 'd', 'bench'])
     ap.add_argument('args', nargs='*')
     ap.add_argument('--steps', type=int, default=4000)
     ap.add_argument('--batch', type=int, default=8)
@@ -1431,6 +1796,11 @@ def main():
     ap.add_argument('--boost', action='store_true',
                     help='adaptive: степень по патчам выбирает маленькая '
                          'conv-сеть (ox_boost.pt) вместо 7 прогонов декодера')
+    ap.add_argument('--v5', action='store_true',
+                    help='формат OXN5: checkerboard-контекст + Гаусс '
+                         '(нужен обученный ox_ctx.pt, см. trainctx)')
+    ap.add_argument('--ctx_hidden', type=int, default=CTX_HIDDEN,
+                    help='ширина контекстной сети (trainctx)')
     a = ap.parse_args()
     if a.verify:
         global _VERIFY
@@ -1459,11 +1829,15 @@ def main():
 
     if a.cmd == 'train':
         cmd_train(a)
+    elif a.cmd == 'trainctx':
+        cmd_trainctx(a)
     elif a.cmd == 'c':
         from PIL import Image
         rgb = load_rgb(a.args[0])
         t0 = time.time()
-        if a.adaptive:
+        if a.v5:
+            blob = with_cpu_fallback(neuro_compress_v5, rgb, a.q, a.ckpt)
+        elif a.adaptive:
             blob = with_cpu_fallback(neuro_compress_adaptive, rgb, a.q, a.ckpt)
         else:
             blob = with_cpu_fallback(neuro_compress, rgb, a.q, a.ckpt)

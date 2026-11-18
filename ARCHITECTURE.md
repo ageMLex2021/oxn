@@ -86,3 +86,25 @@ and a Sobel (high-pass) training loss preserves edge sharpness.
 2. Diffusion/generative decoder mode for ultra-low bitrates (plausibility
    over fidelity).
 3. Full CUDA port of the entropy stage.
+
+## OXN5 — context entropy model (branch `oxn5-context`, experimental)
+
+Ideas from NLAIC (arXiv:1910.06244) and the checkerboard context model
+(He et al., 2021), applied on top of the frozen OXN3 transform: the latent
+probability depends not only on the hyperprior but also on already-decoded
+neighbours. Even-parity tokens ("anchors") are rANS-coded first with the
+usual hyperprior Laplace; odd-parity tokens are coded with a Gaussian whose
+(mu, sigma) come from a small masked-conv network (~460K params,
+`ox_ctx.pt`) that sees only the anchors — decode is two parallel passes, not
+pixel-by-pixel autoregression. Only the context branch is trained
+(`python3 ox_neuro.py trainctx --steps 40000 --data <images>`); the codec
+weights are untouched, and OXN1–OXN4 files decode exactly as before.
+
+Measured on the Kodak holdout (kodim21–24, never trained on): **5.7–18.6%
+smaller files than OXN3 at identical PSNR** (average −11.9%), the gain
+growing towards higher quality — i.e. exactly where the codec used to be
+weakest. Encode: `python3 ox_neuro.py c in.png out.oxh --q 75 --v5`;
+decode is automatic by magic bytes. Two bit-exactness rules keep the rANS
+stream in sync: the rate scaler `s` is quantized to float32 before use, and
+the context net is fed the *decoded* (clipped to ±256) anchor latent, not
+the true one.
