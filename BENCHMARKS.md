@@ -47,6 +47,20 @@ via Pillow for the rest. OXN encode uses adaptive rate (best quality mode).
 On a 201 MP photo OXN adaptive encode is ~110 s (GPU). CLI startup
 (torch init + model load) adds ~10 s if the codec runs as a fresh process.
 
+## The flip side: size at matched quality
+
+Same data, read the other way - how many bits do others need to match OXN?
+
+| OXN operating point | to match it, you need |
+|---|---|
+| PSNR 26.85 @ 0.15 bpp | JPEG ~0.30 bpp (**2x bigger file**) |
+| LPIPS 0.203 @ 0.15 bpp | JPEG XL does not reach it even at 0.30 bpp (0.226) |
+| MS-SSIM 0.939 @ 0.15 bpp | JPEG XL ~0.30 bpp (0.946, ~2x bigger file) |
+
+So at very low bitrates OXN keeps roughly JPEG XL / double-JPEG
+perceptual quality at half the size of what those codecs need for the
+same numbers.
+
 ## Visual comparison (0.20 bpp, crop)
 
 ![crops](bench_crops_02bpp.png)
