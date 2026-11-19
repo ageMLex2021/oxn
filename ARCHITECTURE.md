@@ -123,7 +123,7 @@ PSNR: **OXN5 is 5.7–18.6% smaller than OXN3** (avg −11.9%, gain grows with
 quality); **OXN6 is 1.5–14.5% smaller than OXN4** (avg −9.5%, gain grows
 towards low bitrates); after 40K context-training steps **OXN7 is a further
 4.46–15.92% smaller than OXN5** on average at q15/q50/q92 (up to −31% vs OXN3
-at q92). Decode is automatic by magic bytes for OXN1–OXN8. Legacy bit-exactness
+at q92). Decode is automatic by magic bytes for OXN1–OXN9. Legacy bit-exactness
 rules keeping the rANS stream in sync: the rate scaler is quantized (float32 in
 OXN5/OXN7, float16 ladder in OXN6) before use, the context net is fed the
 *decoded* (clipped to ±256) latent, and ctx runs CPU fp64 with mkldnn off,
@@ -165,3 +165,15 @@ At q50 on kodim21–24, with `--verify`, OXN8 adaptive totals **34,883 bytes vs
 37,920 for OXN6** (−8.0% total) at essentially equal PSNR (per-image changes
 within +0.03 dB). OXN8 flat totals **57,889 bytes vs 57,854 for OXN7** (+0.06%),
 with PSNR changes within ±0.003 dB.
+
+## OXN9 tiny — local speed experiment
+
+The `oxn9-tiny` branch keeps OXN8 intact and adds an auto-detected OXN9 stream.
+Its architecture uses dim=48, one encoder/decoder block, latent=8, hyper width
+and channels=8, and an 8-wide context network: 154,592 parameters in total versus
+17,123,051 for OXN8 (110.8× fewer). It is trained from scratch on available local
+photographs because the original `data/` corpus is absent. This is a speed and
+feasibility experiment, not a comparable Kodak RD benchmark. At 2880×2160 q50,
+adaptive encode measured 0.62 s versus 5.06 s for OXN8 (8.2×), decode 0.35 s
+versus 1.35 s (3.9×); PSNR dropped from 21.70 to 18.00 dB and the file shrank
+from 167,312 to 68,576 bytes. See `BENCHMARKS.md` for the flat mode and caveats.

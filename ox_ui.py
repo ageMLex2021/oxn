@@ -28,6 +28,8 @@ OX_NEURO = os.path.join(HERE, 'ox_neuro.py')
 CKPT = os.path.join(HERE, 'ox_neuro.pt')
 CTX7 = os.path.join(HERE, 'ox_ctx7.pt')
 CANON8 = os.path.join(HERE, 'oxn8_canon.npz')
+TINY_CKPT = os.path.join(HERE, 'ox_neuro_tiny.pt')
+TINY_CTX7 = os.path.join(HERE, 'ox_ctx9_tiny.pt')
 MAX_UPLOAD = 4 * 1024 * 1024 * 1024  # 4 ГБ
 _CODEC = None
 _CODEC_LOCK = threading.Lock()
@@ -62,9 +64,9 @@ PAGE = r"""<!DOCTYPE html>
   #drop.over { border-color:var(--acc); background:#101a2a; }
   #drop b { color:var(--fg); }
   .row { display:flex; gap:10px; flex-wrap:wrap; align-items:center; }
-  input[type=number] { background:#0d1117; color:var(--fg);
-    border:1px solid var(--border); border-radius:8px; padding:8px 10px;
-    width:76px; }
+  input[type=number], select { background:#0d1117; color:var(--fg);
+    border:1px solid var(--border); border-radius:8px; padding:8px 10px; }
+  input[type=number] { width:76px; }
   button { background:var(--acc); color:#fff; border:0; border-radius:8px;
            padding:9px 20px; font-size:15px; cursor:pointer; }
   button.ghost { background:#21262d; border:1px solid var(--border); }
@@ -112,6 +114,12 @@ PAGE = r"""<!DOCTYPE html>
 
   <div class="card">
     <div class="row">
+      <label style="color:var(--dim)">model
+        <select id="md">
+          <option value="oxn8">OXN8 (stable)</option>
+          <option value="tiny">OXN9 tiny · 111× fewer params</option>
+        </select>
+      </label>
       <span style="color:var(--dim)">quality</span>
       <input type="number" id="q" value="100" min="1" max="100">
       <label style="color:var(--dim)" title="Включено: адаптивная степень по патчам. Выключено: плоская степень. Оба режима используют детерминированный OXN8.">
@@ -176,7 +184,13 @@ drop.ondrop = async e => {
   addFiles(out);
 };
 $('file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
-$('ad').onchange = () => { $('bs').disabled = !$('ad').checked; };
+function updateMode() {
+  $('bs').disabled = !$('ad').checked || $('md').value === 'tiny';
+  $('bs').title = $('md').value === 'tiny' ? 'OXN9 tiny не использует OXN8 boost' : '';
+}
+$('ad').onchange = updateMode;
+$('md').onchange = updateMode;
+updateMode();
 
 function addFiles(fs) {
   files = files.concat(fs);
@@ -264,6 +278,7 @@ async function run(op) {
       const fd = new FormData();
       fd.append('file', f);
       fd.append('q', $('q').value);
+      fd.append('model', $('md').value);
       fd.append('adaptive', $('ad').checked ? '1' : '0');
       fd.append('boost', $('bs').checked ? '1' : '0');
       fd.append('verify', $('vf').checked ? '1' : '0');
@@ -348,9 +363,12 @@ def do_compress(fields, files):
     if not name.lower().endswith(IMG_EXT):
         raise Skip(name)
     adaptive = fields.get('adaptive', '1') == '1'
-    if (not os.path.exists(CKPT) or not os.path.exists(CTX7)
-            or not os.path.exists(CANON8)):
-        raise RuntimeError('no ox_neuro.pt / ox_ctx7.pt / oxn8_canon.npz — see README.md')
+    tiny = fields.get('model') == 'tiny'
+    if not os.path.exists(CANON8):
+        raise RuntimeError('no oxn8_canon.npz — see README.md')
+    required = (TINY_CKPT, TINY_CTX7) if tiny else (CKPT, CTX7)
+    if not all(os.path.exists(p) for p in required):
+        raise RuntimeError('selected model is not trained yet')
     q = int(fields.get('q', '100'))
     ox = _codec()
     from PIL import Image, ImageOps
@@ -358,9 +376,13 @@ def do_compress(fields, files):
         Image.open(io.BytesIO(data))).convert('RGB'))
     t0 = time.time()
     with _CODEC_LOCK:
-        ox._BOOST_ON = adaptive and fields.get('boost') == '1'
+        ox._BOOST_ON = adaptive and not tiny and fields.get('boost') == '1'
         ox._VERIFY = fields.get('verify') == '1'
-        out = _codec_call(ox, ox.neuro_compress_v8, rgb, q, None, not adaptive)
+        ox.CTX7_FILE = ox.TINY_CTX7 if tiny else ox.OXN8_CTX7
+        if tiny:
+            out = _codec_call(ox, ox.neuro_compress_v9, rgb, q, not adaptive)
+        else:
+            out = _codec_call(ox, ox.neuro_compress_v8, rgb, q, None, not adaptive)
     dt = time.time() - t0
     n, on = len(data), len(out)
     stats = {
@@ -377,7 +399,7 @@ def do_decompress(fields, files):
     # Формат выбирает декодер по magic-байтам, включая legacy OXN1/OXN2.
     if not name.lower().endswith('.oxh') or data[:4] not in (
             b'OXN1', b'OXN2', b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7',
-            b'OXN8'):
+            b'OXN8', b'OXN9'):
         raise Skip(name)
     base = name[:-4]
     ox = _codec()
@@ -420,8 +442,10 @@ class Handler(BaseHTTPRequestHandler):
                     gpu = torch.cuda.get_device_name(0)
             except Exception:
                 pass
-            self._send(200, json.dumps({'cuda': cuda, 'gpu': gpu}).encode(),
-                       'application/json')
+            self._send(200, json.dumps({
+                'cuda': cuda, 'gpu': gpu,
+                'tiny': os.path.exists(TINY_CKPT) and os.path.exists(TINY_CTX7)
+            }).encode(), 'application/json')
         else:
             self._send(404, b'not found')
 

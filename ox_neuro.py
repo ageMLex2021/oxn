@@ -7,7 +7,7 @@ z -> round(z*s)/s. One model covers the whole quality range.
 
 Entropy coding: adaptive OXN8 by default or flat OXN8 with --flat. Its integer
 hyperprior/context path, frozen tables and canonical rANS avoid cross-architecture
-entropy desynchronization. Decompression auto-detects OXN1–OXN8 by magic header.
+entropy desynchronization. Decompression auto-detects OXN1–OXN9 by magic header.
 
 Usage:
   python3 ox_neuro.py train [--steps 40000] [--data data/train]
@@ -122,11 +122,12 @@ def ms_ssim(x, y, k, weights=(0.0448, 0.2856, 0.3001, 0.2363, 0.1333)):
     return v.mean()
 def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
                 shared=False, moe=0, refine=False, hyper=False, window=0,
-                se=False):
+                se=False, hyper_width=64, hyper_c=32, pos_tokens=4096):
     import torch
     import torch.nn as nn
 
-    HYPER_C = 32
+    HYPER_C = hyper_c
+    HYPER_W = hyper_width
 
     def _linc(layer, h):
         """Linear по токенам с чанкованием — размер чанка от свободной памяти."""
@@ -140,9 +141,9 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
         def __init__(self):
             super().__init__()
             self.net = nn.Sequential(
-                nn.Conv2d(latent, 64, 3, padding=1), nn.GELU(),
-                nn.Conv2d(64, 64, 3, stride=2, padding=1), nn.GELU(),
-                nn.Conv2d(64, HYPER_C, 3, stride=2, padding=1))
+                nn.Conv2d(latent, HYPER_W, 3, padding=1), nn.GELU(),
+                nn.Conv2d(HYPER_W, HYPER_W, 3, stride=2, padding=1), nn.GELU(),
+                nn.Conv2d(HYPER_W, HYPER_C, 3, stride=2, padding=1))
 
         def forward(self, g):
             return self.net(g)
@@ -152,10 +153,10 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
         def __init__(self):
             super().__init__()
             self.net = nn.Sequential(
-                nn.ConvTranspose2d(HYPER_C, 64, 4, stride=2, padding=1),
+                nn.ConvTranspose2d(HYPER_C, HYPER_W, 4, stride=2, padding=1),
                 nn.GELU(),
-                nn.ConvTranspose2d(64, 64, 4, stride=2, padding=1), nn.GELU(),
-                nn.Conv2d(64, latent * 2, 3, padding=1))
+                nn.ConvTranspose2d(HYPER_W, HYPER_W, 4, stride=2, padding=1), nn.GELU(),
+                nn.Conv2d(HYPER_W, latent * 2, 3, padding=1))
 
         def forward(self, w):
             return self.net(w)
@@ -290,7 +291,7 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
             super().__init__()
             self.patch = patch
             self.embed = nn.Linear(patch * patch * 3, dim)
-            self.pos = nn.Parameter(torch.zeros(1, 4096, dim))
+            self.pos = nn.Parameter(torch.zeros(1, pos_tokens, dim))
             self.depth = depth
             self.shared = shared
             if shared:
@@ -520,9 +521,11 @@ def cmd_train(args):
 
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     model = build_model(dim=args.dim, depth=args.depth, latent=args.latent,
-                        shared=args.shared, moe=args.moe,
+                        heads=args.heads, shared=args.shared, moe=args.moe,
                         refine=args.refine, hyper=args.hyper,
-                        window=args.window, se=args.se).to(dev)
+                        window=args.window, se=args.se,
+                        hyper_width=args.hyper_width, hyper_c=args.hyper_c,
+                        pos_tokens=args.pos_tokens).to(dev)
     if args.init:
         ck = torch.load(args.init, map_location='cpu', weights_only=True)
         model.load_state_dict(ck['model'], strict=False)
@@ -620,10 +623,12 @@ def cmd_train(args):
             torch.save({'model': model.state_dict(),
                         'arch': {'patch': PATCH, 'dim': args.dim,
                                  'depth': args.depth, 'latent': args.latent,
-                                 'heads': HEADS, 'shared': args.shared,
+                                 'heads': args.heads, 'shared': args.shared,
                                  'moe': args.moe, 'refine': args.refine,
                                  'hyper': args.hyper, 'window': args.window,
-                                 'se': args.se}},
+                                 'se': args.se, 'hyper_width': args.hyper_width,
+                                 'hyper_c': args.hyper_c,
+                                 'pos_tokens': args.pos_tokens}},
                         args.out + '.part')
             if ctx7 is not None:
                 torch.save({'state': ctx7.state_dict(), 'latent': args.latent,
@@ -631,10 +636,13 @@ def cmd_train(args):
                             'groups': groups7}, args.ctx_file + '.part')
     torch.save({'model': model.state_dict(),
                 'arch': {'patch': PATCH, 'dim': args.dim, 'depth': args.depth,
-                         'latent': args.latent, 'heads': HEADS,
+                         'latent': args.latent, 'heads': args.heads,
                          'shared': args.shared, 'moe': args.moe,
                          'refine': args.refine, 'hyper': args.hyper,
-                         'window': args.window, 'se': args.se}}, args.out)
+                         'window': args.window, 'se': args.se,
+                         'hyper_width': args.hyper_width,
+                         'hyper_c': args.hyper_c,
+                         'pos_tokens': args.pos_tokens}}, args.out)
     if ctx7 is not None:
         torch.save({'state': ctx7.state_dict(), 'latent': args.latent,
                     'hidden': ctx7.net[0].out_channels,
@@ -697,10 +705,16 @@ def _decode_autocast(dev):
 
 _FORCE_CPU = False     # после CUDA OOM переключаемся на CPU насовсем
 _VERIFY = False        # самопроверка энтропийного потока после сжатия (--verify)
+_MODEL_CACHE = {}
+
 
 def _load(path=None):
     import torch
     path = path or CKPT
+    dev = 'cpu' if _FORCE_CPU or not torch.cuda.is_available() else 'cuda'
+    key = (path, dev)
+    if key in _MODEL_CACHE:
+        return _MODEL_CACHE[key]
     if not os.path.exists(path):
         sys.exit(f'no checkpoint {path} — train first: python3 ox_neuro.py train')
     ck = torch.load(path, map_location='cpu', weights_only=True)
@@ -712,11 +726,15 @@ def _load(path=None):
     arch.setdefault('hyper', False)
     arch.setdefault('window', 0)
     arch.setdefault('se', False)
+    arch.setdefault('hyper_width', 64)
+    arch.setdefault('hyper_c', 32)
+    arch.setdefault('pos_tokens', 4096)
     model = build_model(**arch)
     model.load_state_dict(ck['model'], strict=False)  # старые чекпоинты без scale_emb
     model.__dict__['_ckpt_path'] = path
-    dev = 'cpu' if _FORCE_CPU or not torch.cuda.is_available() else 'cuda'
-    return model.eval().to(dev), dev
+    model = model.eval().to(dev)
+    _MODEL_CACHE[key] = (model, dev)
+    return model, dev
 
 
 # ---- общее канальное rANS-кодирование квантованных латентов ---------------
@@ -1932,6 +1950,9 @@ def _neuro_decompress_v6(blob, ckpt):
 # Неизвестное зануляется: паттерн нулей детерминирован порядком декодирования
 # и совпадает на обоих концах — маскированные свёртки не нужны.
 CTX7_FILE = os.path.join(HERE, 'ox_ctx7.pt')
+OXN8_CTX7 = CTX7_FILE
+TINY_CKPT = os.path.join(HERE, 'ox_neuro_tiny.pt')
+TINY_CTX7 = os.path.join(HERE, 'ox_ctx9_tiny.pt')
 CTX7_GROUPS = (6, 6, 6, 6)
 _CTX7 = None
 
@@ -2411,6 +2432,18 @@ def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False):
     return bytes(out)
 
 
+def neuro_compress_v9(rgb, q=75, flat=False):
+    global CTX7_FILE, _BOOST_ON
+    CTX7_FILE = TINY_CTX7
+    old_boost = _BOOST_ON
+    _BOOST_ON = False
+    try:
+        blob = neuro_compress_v8(rgb, q, TINY_CKPT, flat)
+    finally:
+        _BOOST_ON = old_boost
+    return b'OXN9' + blob[4:]
+
+
 def _neuro_decompress_v8(blob, ckpt):
     import torch
     H, W, p, C, flat, K = struct.unpack('<HHBBBB', blob[4:12])
@@ -2721,11 +2754,17 @@ def _neuro_decompress_v2(blob, ckpt):
     return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
-def neuro_decompress(blob, ckpt=None):
+def neuro_decompress(blob, ckpt=None, ctx_file=None):
     import torch
+    global CTX7_FILE
     magic = blob[:4]
+    if magic == b'OXN9':
+        ckpt = ckpt or TINY_CKPT
+        CTX7_FILE = TINY_CTX7
+    elif magic in (b'OXN7', b'OXN8'):
+        CTX7_FILE = ctx_file or OXN8_CTX7
     # hyper-форматы требуют hyper-модель; если выбранная без неё — ищем подходящую
-    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7', b'OXN8'):
+    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7', b'OXN8', b'OXN9'):
         model, _ = _load(ckpt)
         if getattr(model, 'hyper_enc', None) is None:
             for alt in ('ox_neuro_v10.pt', 'ox_neuro_v9.pt'):
@@ -2733,7 +2772,7 @@ def neuro_decompress(blob, ckpt=None):
                 if os.path.exists(p):
                     ckpt = p
                     break
-    if magic == b'OXN8':
+    if magic in (b'OXN8', b'OXN9'):
         return _neuro_decompress_v8(blob, ckpt)
     if magic == b'OXN7':
         return _neuro_decompress_v7(blob, ckpt)
@@ -2781,35 +2820,35 @@ def cmd_bench(args):
               f'{psnr(rgb, rec):7.2f}')
     for q in (5, 15, 30, 50, 75, 92):
         blob = neuro_compress(rgb, q, args.ckpt)
-        rec = neuro_decompress(blob, args.ckpt)
+        rec = neuro_decompress(blob, args.ckpt, args.ctx_file)
         print(f'{"OXN q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
               f'{psnr(rgb, rec):7.2f}')
     for q in (5, 15, 30, 50, 75, 92):
         blob = neuro_compress_adaptive(rgb, q, args.ckpt)
-        rec = neuro_decompress(blob, args.ckpt)
+        rec = neuro_decompress(blob, args.ckpt, args.ctx_file)
         print(f'{"OXN-адапт q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
               f'{psnr(rgb, rec):7.2f}')
     if os.path.exists(CTX_FILE):
         for q in (5, 15, 30, 50, 75, 92):
             blob = neuro_compress_v5(rgb, q, args.ckpt)
-            rec = neuro_decompress(blob, args.ckpt)
+            rec = neuro_decompress(blob, args.ckpt, args.ctx_file)
             print(f'{"OXN5-ctx q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
                   f'{psnr(rgb, rec):7.2f}')
         for q in (5, 15, 30, 50, 75, 92):
             blob = neuro_compress_v6(rgb, q, args.ckpt)
-            rec = neuro_decompress(blob, args.ckpt)
+            rec = neuro_decompress(blob, args.ckpt, args.ctx_file)
             print(f'{"OXN6-адапт q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
                   f'{psnr(rgb, rec):7.2f}')
     if os.path.exists(CTX7_FILE):
         for q in (5, 15, 30, 50, 75, 92):
             blob = neuro_compress_v7(rgb, q, args.ckpt)
-            rec = neuro_decompress(blob, args.ckpt)
+            rec = neuro_decompress(blob, args.ckpt, args.ctx_file)
             print(f'{"OXN7-кан q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
                   f'{psnr(rgb, rec):7.2f}')
         for flat in (False, True):
             for q in (5, 15, 30, 50, 75, 92):
                 blob = neuro_compress_v8(rgb, q, args.ckpt, flat)
-                rec = neuro_decompress(blob, args.ckpt)
+                rec = neuro_decompress(blob, args.ckpt, args.ctx_file)
                 mode = 'flat' if flat else 'адапт'
                 print(f'{"OXN8-" + mode + " q=" + str(q):>16} '
                       f'{len(blob) * 8 / n:7.3f} {psnr(rgb, rec):7.2f}')
@@ -2829,6 +2868,10 @@ def main():
     ap.add_argument('--dim', type=int, default=DIM)
     ap.add_argument('--depth', type=int, default=DEPTH)
     ap.add_argument('--latent', type=int, default=LATENT)
+    ap.add_argument('--heads', type=int, default=HEADS)
+    ap.add_argument('--hyper_width', type=int, default=64)
+    ap.add_argument('--hyper_c', type=int, default=32)
+    ap.add_argument('--pos_tokens', type=int, default=4096)
     ap.add_argument('--shared', action='store_true',
                     help='single block looped depth times (weight tying)')
     ap.add_argument('--moe', type=int, default=0,
@@ -2861,6 +2904,8 @@ def main():
     ap.add_argument('--boost', action='store_true',
                     help='OXN8: степень по патчам выбирает маленькая '
                          'conv-сеть (ox_boost.pt) вместо 7 прогонов декодера')
+    ap.add_argument('--tiny', action='store_true',
+                    help='experimental OXN9: ox_neuro_tiny.pt + ox_ctx9_tiny.pt')
     ap.add_argument('--verify', action='store_true',
                     help='после сжатия декодировать энтропийный поток обратно '
                          'и сверить (медленно на больших изображениях)')
@@ -2903,14 +2948,17 @@ def main():
         from PIL import Image
         rgb = load_rgb(a.args[0])
         t0 = time.time()
-        blob = with_cpu_fallback(neuro_compress_v8, rgb, a.q, a.ckpt, a.flat)
+        if a.tiny:
+            blob = with_cpu_fallback(neuro_compress_v9, rgb, a.q, a.flat)
+        else:
+            blob = with_cpu_fallback(neuro_compress_v8, rgb, a.q, a.ckpt, a.flat)
         open(a.args[1], 'wb').write(blob)
         n = rgb.shape[0] * rgb.shape[1]
         print(f'{a.args[0]} -> {a.args[1]}: {len(blob)} байт '
               f'({len(blob) * 8 / n:.3f} bpp, s={q2s(a.q):.2f}) in {time.time() - t0:.2f} s')
     elif a.cmd == 'd':
         blob_data = open(a.args[0], 'rb').read()
-        rec = with_cpu_fallback(neuro_decompress, blob_data, a.ckpt)
+        rec = with_cpu_fallback(neuro_decompress, blob_data, a.ckpt, a.ctx_file)
         from PIL import Image
         if a.args[1].lower().endswith(('.jpg', '.jpeg')):
             Image.fromarray(rec).save(a.args[1], quality=95, subsampling=0)

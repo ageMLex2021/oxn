@@ -141,7 +141,7 @@ python3 ox_neuro.py trainctx --steps 100000 --batch 8 --ctx_hidden 192 \
 ```bash
 python3 ox_neuro.py c in.png out.oxh --q 75 [--verify]  # адаптивный OXN8
 python3 ox_neuro.py c in.png out.oxh --q 75 --flat      # плоский OXN8
-python3 ox_neuro.py d in.oxh out.jpg                     # OXN1–OXN8 по magic
+python3 ox_neuro.py d in.oxh out.jpg                     # OXN1–OXN9 по magic
 python3 ox_neuro.py trainctx --steps N --ctx_hidden 128 [--groups 6,6,6,6] \
     [--init ox_ctx7.pt.part] --data data/train
 ```
@@ -205,3 +205,10 @@ python3 ox_neuro.py trainctx --steps N --ctx_hidden 128 [--groups 6,6,6,6] \
   44.31 с включая fresh process, roundtrip успешен. Для OXN9 distillation на
   машине отсутствует каталог data/ — обучение и kodim21–24 RD-приёмку нужно
   продолжить после восстановления датасета.
+- 2026-11-19 (локальная ветка oxn9-tiny): добавлен OXN9 tiny рядом с OXN8,
+  154592 параметра вместо 17123051 (110.8×). Autoencoder и ctx обучены с нуля
+  по 4000 шагов на 87 локальных фотографиях из Downloads, поэтому качество не
+  является независимым holdout. 2880×2160 q50 adaptive: encode 5.06→0.62 с,
+  decode 1.35→0.35 с, PSNR 21.70→18.00 dB, bytes 167312→68576. Flat: encode
+  1.68→0.29 с, decode 1.24→0.32 с, PSNR 22.07→18.09 dB. CLI/UI/viewer и
+  CPU-only auto-decode по OXN9 проверены; OXN8 остаётся доступен и не меняется.

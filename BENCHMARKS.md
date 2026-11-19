@@ -61,8 +61,29 @@ The flat bitstream is unchanged. The native library caches CDF/LUT tables,
 replaces Python rANS and element-wise Q20.12 operations, batches the adaptive
 decoder ladder and keeps reconstruction decoding in BF16 on CUDA. UI/viewer
 model loading is reused between files. These timings are a local engineering
-checkpoint, not the target 10× result; model distillation requires the absent
-`data/` training and holdout sets.
+checkpoint.
+
+## OXN9 tiny speed experiment
+
+The local `oxn9-tiny` branch uses 154,592 parameters instead of 17,123,051
+(110.8× fewer), trained from scratch for 4,000 steps on available Downloads
+photographs. The original training corpus and Kodak holdout are absent, and the
+test photograph was also represented in the training pool: **these PSNR values
+are not an independent quality benchmark**.
+
+Same 2880×2160 photograph, q50, warm process:
+
+| model | mode | bytes | PSNR | encode | decode |
+|---|---|---:|---:|---:|---:|
+| OXN8 | adaptive | 167,312 | 21.70 dB | 5.06 s | 1.35 s |
+| OXN9 tiny | adaptive | 68,576 | 18.00 dB | **0.62 s (8.2×)** | **0.35 s (3.9×)** |
+| OXN8 | flat | 266,053 | 22.07 dB | 1.68 s | 1.24 s |
+| OXN9 tiny | flat | 86,151 | 18.09 dB | **0.29 s (5.8×)** | **0.32 s (3.9×)** |
+
+On a 500×890 photograph, warm adaptive encode was 2.31 s on OXN8 versus 0.17 s
+on OXN9 tiny (13.5×); PSNR fell from 26.63 to 23.99 dB. Parameter reduction does
+not translate into a 110× end-to-end speedup because of fixed runtime, memory
+and entropy-coding costs.
 
 ## The flip side: size at matched quality
 
