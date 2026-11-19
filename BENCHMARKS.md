@@ -88,7 +88,7 @@ pip install pillow pillow-jxl-plugin pillow-avif-plugin lpips scikit-image torch
 # images: Kodak kodim21-24
 # Historical OXN4 encode (at commit 11bc847):
 # python3 ox_neuro.py c in.png out.oxh --q <q> --adaptive
-# Current adaptive OXN6 encode: python3 ox_neuro.py c in.png out.oxh --q <q>
-# Current flat OXN7 encode: python3 ox_neuro.py c in.png out.oxh --q <q> --flat
+# Current adaptive OXN8 encode: python3 ox_neuro.py c in.png out.oxh --q <q>
+# Current flat OXN8 encode: python3 ox_neuro.py c in.png out.oxh --q <q> --flat
 # classics: PIL Image.save(..., quality=q) with nearest bpp match
 ```

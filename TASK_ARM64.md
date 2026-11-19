@@ -21,12 +21,13 @@ OX-Neuro — lossy нейрокодек изображений: transformer-ав
 
 - `ox_neuro.pt` — основной кодек (16.9M параметров, latent=24, hyper).
 - `ox_ctx.pt` — контекстная сеть OXN5/OXN6 (checkerboard, hidden=128).
-- `ox_ctx7.pt` — контекстная сеть OXN7 (канальные группы 6,6,6,6 + checkerboard).
+- `ox_ctx7.pt` — контекстная сеть OXN7/OXN8 (канальные группы 6,6,6,6 + checkerboard).
+- `oxn8_canon.npz` — неизменяемые GELU/bucket/rANS-таблицы OXN8, версия 1.
 - Форматы: OXN1/OXN2 (legacy), OXN3 (hyper, плоский), OXN4 (адаптивная
   лесенка), OXN5 (OXN3+контекст), OXN6 (OXN4+контекст), OXN7 (ELIC-style
-  канальные группы + контекст). Новая упаковка — адаптивный OXN6 по умолчанию
-  или плоский OXN7 с `--flat`; декодер выбирает любой поддерживаемый формат по
-  magic-байтам.
+  канальные группы + контекст), OXN8 (integer hyperprior + канальные группы).
+  Новая упаковка — адаптивный OXN8 по умолчанию или плоский OXN8 с `--flat`;
+  декодер выбирает любой поддерживаемый формат по magic-байтам.
 
 Достигнуто на holdout kodim21–24 (эти 4 файла **никогда не обучать**),
 PSNR идентичен:
@@ -36,6 +37,7 @@ PSNR идентичен:
 | OXN5 | OXN3 | −5.7…−18.6% (ср. −11.9%) |
 | OXN6 | OXN4 | −1.5…−14.5% (ср. −9.5%) |
 | OXN7 | OXN5 | −3…−4% (q15), −4…−5% (q50), −13…−16% (q92); суммарно против OXN3 на q92 до **−31%** |
+| OXN8 adaptive | OXN6 | −8.0% суммарно на q50 (kodim21–24), PSNR в пределах +0.03 dB |
 
 ## Setup на arm64
 
@@ -68,11 +70,12 @@ pip install -r requirements.txt          # torch, numpy, pillow
 
 ## Железные правила (нарушение = битые файлы)
 
-1. Всё, что задаёт энтропийные таблицы (hyperprior, контекстные сети),
-   считается **на CPU в fp64 с `torch.backends.mkldnn.enabled = False`** —
-   и на энкодере, и на декодере (`_hyper_pair`, `_ctx_params`).
-2. Скейлер квантуется до использования в ctx-входах: OXN5 — `s` в float32,
-   OXN6 — лесенка в float16, как в заголовке файла.
+1. Для OXN8 всё, что задаёт энтропийные таблицы, идёт только через integer
+   Q20.12-канон (`_qhyper_*`, `_qctx7_*`) и неизменяемый `oxn8_canon.npz`.
+   Запрещены runtime float exp/log в этом пути. Для legacy OXN3–OXN7 канон
+   остаётся CPU fp64 с выключенным oneDNN (`_hyper_pair`, `_ctx_params`).
+2. Скейлер квантуется до использования в ctx-входах: OXN8 — Q8.8 плюс
+   записанный в файл integer log; OXN5 — `s` в float32, OXN6 — лесенка float16.
 3. В контекстную сеть подаётся **декодируемая** версия латента (остаток
    зажат в ±256), не истинная — иначе энкодер и декодер разъезжаются на
    больших `s`.
@@ -136,9 +139,9 @@ python3 ox_neuro.py trainctx --steps 100000 --batch 8 --ctx_hidden 192 \
 ## Полезные команды
 
 ```bash
-python3 ox_neuro.py c in.png out.oxh --q 75 [--verify]  # адаптивный OXN6
-python3 ox_neuro.py c in.png out.oxh --q 75 --flat      # плоский OXN7
-python3 ox_neuro.py d in.oxh out.jpg                     # OXN1–OXN7 по magic
+python3 ox_neuro.py c in.png out.oxh --q 75 [--verify]  # адаптивный OXN8
+python3 ox_neuro.py c in.png out.oxh --q 75 --flat      # плоский OXN8
+python3 ox_neuro.py d in.oxh out.jpg                     # OXN1–OXN8 по magic
 python3 ox_neuro.py trainctx --steps N --ctx_hidden 128 [--groups 6,6,6,6] \
     [--init ox_ctx7.pt.part] --data data/train
 ```
@@ -185,3 +188,11 @@ python3 ox_neuro.py trainctx --steps N --ctx_hidden 128 [--groups 6,6,6,6] \
   q92 −15.92% (средние экономии по bpp; до дообучения −3.3/−4.3/−15.1%).
   Для экспериментов `--ctx_file` теперь задаёт отдельный OXN7-чекпоинт в
   `trainctx`, `train`, `c`, `d` и `bench`.
+- 2026-11-19 (arm64): добавлен OXN8 — adaptive/flat, integer Q20.12
+  hyperprior/context, Q8.8-степени, замороженные GELU/bucket/rANS-таблицы
+  (`oxn8_canon.npz`). Roundtrip с `--verify` прошёл в обоих режимах, GPU-файлы
+  декодированы в свежих CPU-only процессах; C и Python rANS дали идентичные
+  байты. Conv2d/ConvTranspose2d сверены с независимыми int64-циклами. На
+  kodim21–24 q50: adaptive 34883 байт против 37920 у OXN6 (−8.0%), flat
+  57889 против 57854 у OXN7 (+0.06%), PSNR практически совпадает. Реальный
+  x86↔ARM обмен OXN8 ещё нужно выполнить как финальную приёмку.

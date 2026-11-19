@@ -176,7 +176,7 @@ def list_oxh(folder):
         try:
             with open(p, 'rb') as fh:
                 if fh.read(4) in (b'OXN1', b'OXN2', b'OXN3', b'OXN4',
-                                  b'OXN5', b'OXN6', b'OXN7'):
+                                  b'OXN5', b'OXN6', b'OXN7', b'OXN8'):
                     out.append(p)
         except OSError:
             pass

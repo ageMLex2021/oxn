@@ -5,9 +5,9 @@ OX-Neuro — learned image codec (lossy): a transformer autoencoder trained
 to reconstruct itself; the compression ratio is set by a latent SCALER s:
 z -> round(z*s)/s. One model covers the whole quality range.
 
-Entropy coding: adaptive OXN6 by default or flat OXN7 with --flat; both combine
-a hyperprior with spatial context and parametric rANS (optionally via the C
-accelerator `ox prans`). Decompression auto-detects OXN1–OXN7 by magic header.
+Entropy coding: adaptive OXN8 by default or flat OXN8 with --flat. Its integer
+hyperprior/context path, frozen tables and canonical rANS avoid cross-architecture
+entropy desynchronization. Decompression auto-detects OXN1–OXN8 by magic header.
 
 Usage:
   python3 ox_neuro.py train [--steps 40000] [--data data/train]
@@ -761,7 +761,24 @@ def _decode_channels(body, C, T_):
 # Лапласа; в rANS идёт остаток q - round(mu), b квантуется в бакеты.
 RES_RANGE = 256                     # остаток зажат в [-256, 255]
 LOG_B_MIN, LOG_B_STEP, N_BUCK = -4.5, 0.5, 24
+CANON8_FILE = os.path.join(HERE, 'oxn8_canon.npz')
+_CANON8 = None
 RT, RSCALE, RL = 4096, 12, 1 << 23
+
+
+def _canon8():
+    global _CANON8
+    if _CANON8 is None:
+        if not os.path.exists(CANON8_FILE):
+            raise RuntimeError(f'no OXN8 canonical tables: {CANON8_FILE}')
+        with np.load(CANON8_FILE, allow_pickle=False) as ck:
+            if int(ck['version'][0]) != 1:
+                raise RuntimeError('unsupported OXN8 canonical table version')
+            _CANON8 = {name: ck[name].copy() for name in ck.files
+                       if name != 'version'}
+        if _CANON8['tables'].shape != (2 * N_BUCK, 513):
+            raise RuntimeError('invalid OXN8 canonical tables')
+    return _CANON8
 
 # Ускорение: параметрический rANS через C-бинарник ox (с fallback на Python)
 OX_BIN = os.path.join(HERE, 'ox')
@@ -769,13 +786,16 @@ OX_BIN = os.path.join(HERE, 'ox')
 
 def _prans_tables_file(td):
     """Все бакет-таблицы в бинарник: [u32 K][K x 513 x u32 cum LE].
-    Бакеты 0..23 — Лаплас (OXN3/4 + якоря OXN5), 24..47 — Гаусс (контекст
-    OXN5); C-ускоритель читает K из файла, менять его не нужно."""
-    tabs = np.stack([_lap_table(i) for i in range(N_BUCK)]
-                    + [_gauss_table(i) for i in range(N_BUCK)])
+    0..23 — legacy Лаплас, 24..47 — legacy Гаусс; 48..95 — такие же
+    распределения из замороженного канона OXN8."""
+    tabs = np.concatenate([
+        np.stack([_lap_table(i) for i in range(N_BUCK)]
+                 + [_gauss_table(i) for i in range(N_BUCK)]),
+        _canon8()['tables'],
+    ])
     path = os.path.join(td, 'tables.bin')
     with open(path, 'wb') as f:
-        f.write(struct.pack('<I', 2 * N_BUCK))
+        f.write(struct.pack('<I', 4 * N_BUCK))
         f.write(tabs.astype('<u4').tobytes())
     return path
 
@@ -885,7 +905,11 @@ def _gauss_table(idx):
     return cum
 
 def _table_for(bid):
-    return _lap_table(bid) if bid < N_BUCK else _gauss_table(bid - N_BUCK)
+    if bid < N_BUCK:
+        return _lap_table(bid)
+    if bid < 2 * N_BUCK:
+        return _gauss_table(bid - N_BUCK)
+    return _canon8()['tables'][bid - 2 * N_BUCK]
 
 def rans_enc_param(symbols, bids):
     fast = rans_enc_param_fast(symbols, bids)
@@ -1959,6 +1983,357 @@ def _neuro_decompress_v7(blob, ckpt):
     return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
 
 
+# ---- OXN8: детерминированная целочисленная энтропийная модель ------------
+# Слои хранят активации в Q20.12, веса — в Q20.12. Свёртка выполняется над
+# целыми значениями в float64: произведения и все частичные суммы меньше 2^53,
+# поэтому остаются точными целыми независимо от порядка суммирования. Между
+# слоями используются только integer round/shift и замороженная GELU-таблица.
+Q8_FBITS = 12
+Q8_WBITS = 12
+Q8_FSCALE = 1 << Q8_FBITS
+Q8_WSCALE = 1 << Q8_WBITS
+Q8_MAX = 256 * Q8_FSCALE
+_QCTX7 = None
+
+
+def _qround_shift(x, bits):
+    """Round-to-nearest-even для целых NumPy/Torch, включая отрицательные."""
+    floor = x >> bits
+    rem = x & ((1 << bits) - 1)
+    half = 1 << (bits - 1)
+    return floor + ((rem > half) | ((rem == half) & ((floor & 1) != 0)))
+
+
+def _qround_div(num, den):
+    """Round-to-nearest-even для NumPy int64 и положительного делителя."""
+    floor = np.floor_divide(num, den)
+    rem = num - floor * den
+    twice = rem * 2
+    return floor + ((twice > den) | ((twice == den) & ((floor & 1) != 0)))
+
+
+def _qdequant_latent(q_lat, scales_q):
+    num = q_lat * (256 * Q8_FSCALE)
+    return np.clip(_qround_div(num, scales_q[:, None]),
+                   -Q8_MAX, Q8_MAX).astype(np.int64)
+
+
+def _qgelu(x):
+    import torch
+    lut = torch.from_numpy(_canon8()['gelu'].astype(np.int64))
+    pos = x + 8 * Q8_FSCALE
+    idx = torch.clamp(pos >> 4, 0, lut.numel() - 2)
+    frac = pos & 15
+    y0, y1 = lut[idx], lut[idx + 1]
+    y = y0 + _qround_shift((y1 - y0) * frac, 4)
+    return torch.where(x <= -8 * Q8_FSCALE, torch.zeros_like(x),
+                       torch.where(x >= 8 * Q8_FSCALE, x, y))
+
+
+def _qnet_copy(net):
+    import copy
+    import torch
+    import torch.nn as nn
+    q = copy.deepcopy(net).to('cpu', torch.float64).eval()
+    for layer in q.modules():
+        if isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)):
+            layer.weight.data.copy_(torch.round(
+                layer.weight.data * Q8_WSCALE).clamp_(-32768, 32767))
+            if layer.bias is not None:
+                layer.bias.data.copy_(torch.round(
+                    layer.bias.data * (Q8_FSCALE * Q8_WSCALE)))
+    return q
+
+
+def _qnet_run(layers, x):
+    import torch
+    import torch.nn as nn
+    for layer in layers:
+        if isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)):
+            raw = layer(x.to('cpu', torch.float64))
+            if not torch.isfinite(raw).all():
+                raise RuntimeError('OXN8 integer convolution overflow')
+            x = _qround_shift(raw.to(torch.int64), Q8_WBITS)
+            x = torch.clamp(x, -Q8_MAX, Q8_MAX)
+        elif isinstance(layer, nn.GELU):
+            x = _qgelu(x)
+        else:
+            raise RuntimeError(f'OXN8: unsupported entropy layer {layer}')
+    return x
+
+
+def _qhyper_pair(model):
+    cache = model.__dict__.get('_qhyper_pair')
+    if cache is None:
+        enc, dec = _hyper_pair(model, 'cpu')
+        cache = (_qnet_copy(enc), _qnet_copy(dec))
+        model.__dict__['_qhyper_pair'] = cache
+    return cache
+
+
+def _qhyper_encode(model, zqd_q, ht, wt):
+    import torch
+    enc, dec = _qhyper_pair(model)
+    C = zqd_q.shape[1]
+    grid = torch.from_numpy(zqd_q.T.reshape(1, C, ht, wt))
+    ph, pw = (-ht) % 4, (-wt) % 4
+    gpad = torch.nn.functional.pad(grid, (0, pw, 0, ph), mode='replicate')
+    with torch.no_grad():
+        w_real = _qnet_run(enc.net, gpad)
+        w = _qround_shift(w_real, Q8_FBITS)
+        mb = _qnet_run(dec.net, w * Q8_FSCALE)
+    mb = mb[:, :, :ht, :wt].reshape(1, 2 * C, -1)[0].transpose(0, 1)
+    mu_q, logb_q = mb.chunk(2, -1)
+    wq = w[0].reshape(w.shape[1], -1).transpose(0, 1)
+    return (wq.numpy().astype(np.int32), mu_q.numpy(), logb_q.numpy())
+
+
+def _qhyper_decode(model, w, ht, wt):
+    import torch
+    _, dec = _qhyper_pair(model)
+    HC = w.shape[1]
+    ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
+    grid = torch.from_numpy(w.astype(np.int64)).transpose(0, 1).reshape(
+        1, HC, ht4, wt4) * Q8_FSCALE
+    with torch.no_grad():
+        mb = _qnet_run(dec.net, grid)
+    C = model.latent
+    mb = mb[:, :, :ht, :wt].reshape(1, 2 * C, -1)[0].transpose(0, 1)
+    mu_q, logb_q = mb.chunk(2, -1)
+    return mu_q.numpy(), logb_q.numpy()
+
+
+def _qctx7_net(latent):
+    global _QCTX7
+    path = CTX7_FILE
+    if _QCTX7 is None or _QCTX7[0] != (path, latent):
+        ctx, groups = _ctx7_net(latent)
+        _QCTX7 = ((path, latent), _qnet_copy(ctx), groups)
+    return _QCTX7[1], _QCTX7[2]
+
+
+def _qctx7_params(ctx, zg_q, mu_q, logb_q, logs_q, ht, wt):
+    import torch
+    C = zg_q.shape[1]
+    feats = np.concatenate([
+        zg_q.T.reshape(1, C, ht, wt),
+        mu_q.T.reshape(1, C, ht, wt),
+        logb_q.T.reshape(1, C, ht, wt),
+        logs_q.reshape(1, 1, ht, wt)], axis=1)
+    with torch.no_grad():
+        out = _qnet_run(ctx.net, torch.from_numpy(feats))
+    dmu, lsig = out[0].chunk(2, 0)
+    return dmu.reshape(C, -1).T.numpy(), lsig.reshape(C, -1).T.numpy()
+
+
+def _q8_lap_buckets(logb_q):
+    thresholds = _canon8()['lap_thresholds']
+    return (2 * N_BUCK + np.searchsorted(thresholds, logb_q, side='right')
+            ).astype(np.int32)
+
+
+def _q8_gauss_buckets(lsig_q):
+    thresholds = _canon8()['gauss_thresholds']
+    return (3 * N_BUCK + np.searchsorted(thresholds, lsig_q, side='right')
+            ).astype(np.int32)
+
+
+def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False):
+    """OXN8: канонический integer hyperprior + channel-group context."""
+    import torch
+    model, dev = _load(ckpt)
+    if getattr(model, 'hyper_enc', None) is None:
+        sys.exit('OXN8 требует hyper-чекпоинт (--hyper при обучении кодека)')
+    p = model.patch
+    H, W = rgb.shape[:2]
+    canvas, Hp, Wp = _pad_image(rgb, p)
+    ht, wt = Hp // p, Wp // p
+    x = torch.from_numpy(canvas).permute(2, 0, 1)[None]
+    if dev == 'cuda' and Hp * Wp > 16_000_000:
+        x = x.to(torch.bfloat16)
+    x = x.to(dev)
+    with torch.no_grad(), _maybe_autocast(dev, Hp * Wp):
+        z = model.encode(x)[0]
+    del x
+    if dev == 'cuda':
+        torch.cuda.empty_cache()
+    zf = z.float()
+    T_, C = zf.shape
+    zs = zf.cpu().numpy()
+    if flat:
+        scales_q = np.array([round(float(np.float32(q2s(q))) * 256)], np.int64)
+        smap = np.zeros(T_, np.uint8)
+        q_lat = np.round(zs * (scales_q[0] / 256.0)).astype(np.int64)
+    else:
+        s0 = q2s(q)
+        lam = TAU / (s0 * s0)
+        scales_q = np.rint(np.array(LADDER) * 256).astype(np.int64)
+        scales = scales_q.astype(np.float32) / 256.0
+        s0_q = np.array([round(float(np.float32(s0)) * 256)], np.int64)
+        q0 = np.round(zs * (s0_q[0] / 256.0)).astype(np.int64)
+        zqd0_q = _qdequant_latent(q0, np.full(T_, s0_q[0], np.int64))
+        _, mu0_q, logb0_q = _qhyper_encode(model, zqd0_q, ht, wt)
+        mu0r = _qround_shift(mu0_q, Q8_FBITS)
+        logb0 = logb0_q.astype(np.float64) / Q8_FSCALE
+        b0 = np.log1p(np.exp(logb0)) + 1e-2
+        Dk, Rk, Qk, Ek = [], [], [], []
+        use_boost = _BOOST_ON and _boost_net(dev) is not False
+        mid = _boost_net(dev)[3] if use_boost else []
+        for k, s in enumerate(scales):
+            sf = float(s)
+            qk = np.round(zs * sf)
+            Qk.append(qk)
+            Rk.append((np.abs(qk - mu0r) / b0).sum(axis=1))
+            if use_boost:
+                Ek.append(((zs * sf - qk) ** 2).mean(axis=1))
+            if not use_boost or k in mid:
+                zt = torch.from_numpy((qk / sf).astype(np.float32))[None].to(dev)
+                lg = torch.full((1, T_), math.log(sf), device=dev)
+                xrn = _run_decode(model, zt, Hp, Wp, lg, dev)
+                d = ((xrn - canvas) ** 2).mean(2)
+                Dk.append(d.reshape(ht, p, wt, p).mean(axis=(1, 3)).reshape(-1)
+                          * 65025.0)
+        if use_boost:
+            D = _boost_predict(model, canvas, zs, np.stack(Ek), np.stack(Rk),
+                               np.stack(Dk), ht, wt, p, dev)
+        else:
+            D = np.stack(Dk)
+        R = np.stack(Rk)
+        choice = np.argmin(D + lam * R, axis=0).astype(np.uint8)
+        smap = choice
+        q_lat = np.zeros_like(Qk[0], dtype=np.int64)
+        for k in range(len(scales_q)):
+            m = choice == k
+            q_lat[m] = Qk[k][m]
+    stok_q = scales_q[smap]
+    logs_q = np.rint(np.log(scales_q.astype(np.float64) / 256.0)
+                     * Q8_FSCALE).astype(np.int64)
+    zqd_q = _qdequant_latent(q_lat, stok_q)
+    w, mu_q, logb_q = _qhyper_encode(model, zqd_q, ht, wt)
+    ctx, groups = _qctx7_net(C)
+    anch = _anchor_mask(ht, wt)
+    logs_map_q = logs_q[smap]
+    mu_r = _qround_shift(mu_q, Q8_FBITS)
+    bids_l = _q8_lap_buckets(logb_q)
+    qd = np.zeros((T_, C), np.int64)
+    streams = []
+    for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+        for phase in (True, False):
+            pos = anch if phase else ~anch
+            if gi == 0 and phase:
+                resid = (np.clip(q_lat - mu_r, -RES_RANGE, RES_RANGE - 1)
+                         + RES_RANGE)
+                streams.append(_enc_syms(resid[pos][:, lo:hi],
+                                         bids_l[pos][:, lo:hi]))
+                mu_ref = mu_r
+            else:
+                zg_q = _qdequant_latent(qd, stok_q)
+                dmu_q, lsig_q = _qctx7_params(
+                    ctx, zg_q, mu_q, logb_q, logs_map_q, ht, wt)
+                mu_nr = _qround_shift(mu_q + dmu_q, Q8_FBITS)
+                resid = (np.clip(q_lat - mu_nr, -RES_RANGE, RES_RANGE - 1)
+                         + RES_RANGE)
+                bids = _q8_gauss_buckets(lsig_q)
+                streams.append(_enc_syms(resid[pos][:, lo:hi],
+                                         bids[pos][:, lo:hi]))
+                mu_ref = mu_nr
+            qd[pos, lo:hi] = (resid[pos][:, lo:hi] - RES_RANGE
+                              + mu_ref[pos][:, lo:hi])
+    wblob = _encode_flat(w)
+    HC = w.shape[1]
+    out = bytearray(b'OXN8')
+    out += struct.pack('<HHBBBB', H, W, p, C, int(flat), len(scales_q))
+    for sq, lq in zip(scales_q, logs_q):
+        out += struct.pack('<Hh', int(sq), int(lq))
+    out += struct.pack('<B', len(groups))
+    out += bytes(groups)
+    out += struct.pack('<H', HC)
+    out += struct.pack('<I', len(wblob)) + wblob
+    if not flat:
+        mapblob = rans_encode(smap.tobytes())
+        out += struct.pack('<I', len(mapblob)) + mapblob
+    for blob in streams:
+        out += struct.pack('<I', len(blob)) + blob
+    return bytes(out)
+
+
+def _neuro_decompress_v8(blob, ckpt):
+    import torch
+    H, W, p, C, flat, K = struct.unpack('<HHBBBB', blob[4:12])
+    if flat not in (0, 1):
+        raise RuntimeError('corrupt OXN8: invalid rate mode')
+    pos = 12
+    scales_q = np.empty(K, np.int64)
+    logs_q = np.empty(K, np.int64)
+    for k in range(K):
+        scales_q[k], logs_q[k] = struct.unpack('<Hh', blob[pos:pos + 4])
+        pos += 4
+    if K == 0 or np.any(scales_q <= 0):
+        raise RuntimeError('corrupt OXN8: invalid scales')
+    (G,) = struct.unpack('<B', blob[pos:pos + 1]); pos += 1
+    groups = tuple(struct.unpack(f'<{G}B', blob[pos:pos + G])); pos += G
+    (HC,) = struct.unpack('<H', blob[pos:pos + 2]); pos += 2
+    model, dev = _load(ckpt)
+    ctx, ck_groups = _qctx7_net(C)
+    if ck_groups != groups:
+        sys.exit(f'ox_ctx7.pt: groups {ck_groups}, в файле {groups}')
+    Hp = (H + p - 1) // p * p
+    Wp = (W + p - 1) // p * p
+    ht, wt = Hp // p, Wp // p
+    T_ = ht * wt
+    ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
+    (wlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    w = _decode_flat(blob[pos:pos + wlen], ht4 * wt4 * HC).reshape(ht4 * wt4, HC)
+    pos += wlen
+    if flat:
+        if K != 1:
+            raise RuntimeError('corrupt OXN8: flat mode requires one scale')
+        smap = np.zeros(T_, np.uint8)
+    else:
+        (mlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+        smap = np.frombuffer(rans_decode(blob[pos:pos + mlen]), np.uint8)
+        pos += mlen
+        if smap.shape[0] != T_ or np.any(smap >= K):
+            raise RuntimeError('corrupt OXN8: invalid scale map')
+    stok_q = scales_q[smap]
+    mu_q, logb_q = _qhyper_decode(model, w, ht, wt)
+    anch = _anchor_mask(ht, wt)
+    logs_map_q = logs_q[smap]
+    mu_r = _qround_shift(mu_q, Q8_FBITS)
+    bids_l = _q8_lap_buckets(logb_q)
+    qd = np.zeros((T_, C), np.int64)
+    for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+        for phase in (True, False):
+            posm = anch if phase else ~anch
+            (slen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+            if gi == 0 and phase:
+                resid = _dec_syms(blob[pos:pos + slen],
+                                  bids_l[posm][:, lo:hi])
+                mu_ref = mu_r
+            else:
+                zg_q = _qdequant_latent(qd, stok_q)
+                dmu_q, lsig_q = _qctx7_params(
+                    ctx, zg_q, mu_q, logb_q, logs_map_q, ht, wt)
+                mu_nr = _qround_shift(mu_q + dmu_q, Q8_FBITS)
+                bids = _q8_gauss_buckets(lsig_q)
+                resid = _dec_syms(blob[pos:pos + slen],
+                                  bids[posm][:, lo:hi])
+                mu_ref = mu_nr
+            pos += slen
+            qd[posm, lo:hi] = (resid.reshape(int(posm.sum()), hi - lo)
+                               - RES_RANGE + mu_ref[posm][:, lo:hi])
+    if pos != len(blob):
+        raise RuntimeError(f'corrupt OXN8: trailing bytes ({len(blob) - pos})')
+    scales = scales_q.astype(np.float32) / 256.0
+    stok = scales[smap]
+    zq = qd / stok[:, None]
+    z = torch.from_numpy(zq.astype(np.float32))[None].to(dev)
+    logs = logs_q[smap].astype(np.float32) / Q8_FSCALE
+    lg = torch.from_numpy(logs)[None].to(dev)
+    xr = _run_decode(model, z, Hp, Wp, lg, dev)
+    return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
 def cmd_trainctx(args):
     """Обучение контекстной ветки OXN5/OXN6: энкодер и hyperprior
     заморожены, минимизируется энтропия не-якорных токенов под дискретным
@@ -2196,7 +2571,7 @@ def neuro_decompress(blob, ckpt=None):
     import torch
     magic = blob[:4]
     # hyper-форматы требуют hyper-модель; если выбранная без неё — ищем подходящую
-    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7'):
+    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7', b'OXN8'):
         model, _ = _load(ckpt)
         if getattr(model, 'hyper_enc', None) is None:
             for alt in ('ox_neuro_v10.pt', 'ox_neuro_v9.pt'):
@@ -2204,6 +2579,8 @@ def neuro_decompress(blob, ckpt=None):
                 if os.path.exists(p):
                     ckpt = p
                     break
+    if magic == b'OXN8':
+        return _neuro_decompress_v8(blob, ckpt)
     if magic == b'OXN7':
         return _neuro_decompress_v7(blob, ckpt)
     if magic == b'OXN6':
@@ -2275,6 +2652,13 @@ def cmd_bench(args):
             rec = neuro_decompress(blob, args.ckpt)
             print(f'{"OXN7-кан q=" + str(q):>16} {len(blob) * 8 / n:7.3f} '
                   f'{psnr(rgb, rec):7.2f}')
+        for flat in (False, True):
+            for q in (5, 15, 30, 50, 75, 92):
+                blob = neuro_compress_v8(rgb, q, args.ckpt, flat)
+                rec = neuro_decompress(blob, args.ckpt)
+                mode = 'flat' if flat else 'адапт'
+                print(f'{"OXN8-" + mode + " q=" + str(q):>16} '
+                      f'{len(blob) * 8 / n:7.3f} {psnr(rgb, rec):7.2f}')
 
 
 def main():
@@ -2319,9 +2703,9 @@ def main():
     ap.add_argument('--out', default=CKPT, help='where to save the checkpoint (train)')
     ap.add_argument('--ckpt', default=None, help='checkpoint for c/d/bench')
     ap.add_argument('--flat', action='store_true',
-                    help='плоский OXN7 вместо адаптивного OXN6 (по умолчанию)')
+                    help='плоский OXN8 вместо адаптивного OXN8 (по умолчанию)')
     ap.add_argument('--boost', action='store_true',
-                    help='OXN6: степень по патчам выбирает маленькая '
+                    help='OXN8: степень по патчам выбирает маленькая '
                          'conv-сеть (ox_boost.pt) вместо 7 прогонов декодера')
     ap.add_argument('--verify', action='store_true',
                     help='после сжатия декодировать энтропийный поток обратно '
@@ -2365,8 +2749,7 @@ def main():
         from PIL import Image
         rgb = load_rgb(a.args[0])
         t0 = time.time()
-        compress = neuro_compress_v7 if a.flat else neuro_compress_v6
-        blob = with_cpu_fallback(compress, rgb, a.q, a.ckpt)
+        blob = with_cpu_fallback(neuro_compress_v8, rgb, a.q, a.ckpt, a.flat)
         open(a.args[1], 'wb').write(blob)
         n = rgb.shape[0] * rgb.shape[1]
         print(f'{a.args[0]} -> {a.args[1]}: {len(blob)} байт '

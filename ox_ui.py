@@ -26,8 +26,8 @@ from urllib.parse import quote
 HERE = os.path.dirname(os.path.abspath(__file__))
 OX_NEURO = os.path.join(HERE, 'ox_neuro.py')
 CKPT = os.path.join(HERE, 'ox_neuro.pt')
-CTX = os.path.join(HERE, 'ox_ctx.pt')
 CTX7 = os.path.join(HERE, 'ox_ctx7.pt')
+CANON8 = os.path.join(HERE, 'oxn8_canon.npz')
 MAX_UPLOAD = 4 * 1024 * 1024 * 1024  # 4 ГБ
 
 IMG_EXT = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff')
@@ -90,7 +90,7 @@ PAGE = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>OX<span class="x">·</span>Neuro Hyper <span id="hw" class="badge cpu">…</span></h1>
-  <div class="sub">neural image compression · adaptive OXN6 / flat OXN7 · hyperprior</div>
+  <div class="sub">neural image compression · deterministic integer OXN8 · hyperprior</div>
 
   <div class="card">
     <div id="drop">
@@ -112,8 +112,8 @@ PAGE = r"""<!DOCTYPE html>
     <div class="row">
       <span style="color:var(--dim)">quality</span>
       <input type="number" id="q" value="100" min="1" max="100">
-      <label style="color:var(--dim)" title="Включено: адаптивная степень по патчам OXN6. Выключено: плоская степень OXN7.">
-        <input type="checkbox" id="ad" checked> adaptive OXN6 (off = flat OXN7)
+      <label style="color:var(--dim)" title="Включено: адаптивная степень по патчам. Выключено: плоская степень. Оба режима используют детерминированный OXN8.">
+        <input type="checkbox" id="ad" checked> adaptive OXN8 (off = flat OXN8)
       </label>
       <label style="color:var(--dim)" title="Быстрый выбор адаптивной степени маленькой нейросетью; цена — около 0.5 дБ PSNR">
         <input type="checkbox" id="bs" checked> boost speed for adaptive
@@ -326,9 +326,9 @@ def do_compress(fields, files):
     if not name.lower().endswith(IMG_EXT):
         raise Skip(name)
     adaptive = fields.get('adaptive', '1') == '1'
-    ctx = CTX if adaptive else CTX7
-    if not os.path.exists(CKPT) or not os.path.exists(ctx):
-        raise RuntimeError(f'no ox_neuro.pt / {os.path.basename(ctx)} model — see README.md')
+    if (not os.path.exists(CKPT) or not os.path.exists(CTX7)
+            or not os.path.exists(CANON8)):
+        raise RuntimeError('no ox_neuro.pt / ox_ctx7.pt / oxn8_canon.npz — see README.md')
     q = fields.get('q', '100')
     cmd = [sys.executable, OX_NEURO, 'c', None, None, '--q', q]
     if adaptive:
@@ -364,7 +364,8 @@ def do_decompress(fields, files):
     name, data = files['file']
     # Формат выбирает декодер по magic-байтам, включая legacy OXN1/OXN2.
     if not name.lower().endswith('.oxh') or data[:4] not in (
-            b'OXN1', b'OXN2', b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7'):
+            b'OXN1', b'OXN2', b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7',
+            b'OXN8'):
         raise Skip(name)
     base = name[:-4]
     with tempfile.TemporaryDirectory(prefix='oxh_') as td:
@@ -449,8 +450,8 @@ def main():
         port = int(sys.argv[sys.argv.index('--port') + 1])
     if '--host' in sys.argv:
         host = sys.argv[sys.argv.index('--host') + 1]
-    if not os.path.exists(CKPT) or not os.path.exists(CTX) or not os.path.exists(CTX7):
-        print('warning: no ox_neuro.pt / ox_ctx.pt / ox_ctx7.pt — see README.md',
+    if not os.path.exists(CKPT) or not os.path.exists(CTX7) or not os.path.exists(CANON8):
+        print('warning: no ox_neuro.pt / ox_ctx7.pt / oxn8_canon.npz — see README.md',
               file=sys.stderr)
     print(f'OXH UI: http://{host}:{port}')
     ThreadingHTTPServer((host, port), Handler).serve_forever()
