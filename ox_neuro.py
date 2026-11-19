@@ -5,13 +5,13 @@ OX-Neuro — learned image codec (lossy): a transformer autoencoder trained
 to reconstruct itself; the compression ratio is set by a latent SCALER s:
 z -> round(z*s)/s. One model covers the whole quality range.
 
-Entropy coding: OXN7 combines a hyperprior with channel-group/checkerboard
-context and parametric rANS (optionally via the C accelerator `ox prans`).
-Decompression auto-detects OXN1–OXN7 by magic header.
+Entropy coding: adaptive OXN6 by default or flat OXN7 with --flat; both combine
+a hyperprior with spatial context and parametric rANS (optionally via the C
+accelerator `ox prans`). Decompression auto-detects OXN1–OXN7 by magic header.
 
 Usage:
   python3 ox_neuro.py train [--steps 40000] [--data data/train]
-  python3 ox_neuro.py c in.png out.oxh [--q 100] [--verify]
+  python3 ox_neuro.py c in.png out.oxh [--q 100] [--flat] [--boost] [--verify]
   python3 ox_neuro.py d in.oxh out.jpg
   python3 ox_neuro.py bench in.png
 """
@@ -2318,6 +2318,11 @@ def main():
                     help='fine-tune decoder only (encoder/quantizer frozen)')
     ap.add_argument('--out', default=CKPT, help='where to save the checkpoint (train)')
     ap.add_argument('--ckpt', default=None, help='checkpoint for c/d/bench')
+    ap.add_argument('--flat', action='store_true',
+                    help='плоский OXN7 вместо адаптивного OXN6 (по умолчанию)')
+    ap.add_argument('--boost', action='store_true',
+                    help='OXN6: степень по патчам выбирает маленькая '
+                         'conv-сеть (ox_boost.pt) вместо 7 прогонов декодера')
     ap.add_argument('--verify', action='store_true',
                     help='после сжатия декодировать энтропийный поток обратно '
                          'и сверить (медленно на больших изображениях)')
@@ -2330,6 +2335,9 @@ def main():
     if a.verify:
         global _VERIFY
         _VERIFY = True
+    if a.boost:
+        global _BOOST_ON
+        _BOOST_ON = True
 
     def with_cpu_fallback(fn, *fargs):
         """При нехватке VRAM — повтор на CPU (в RAM)."""
@@ -2357,7 +2365,8 @@ def main():
         from PIL import Image
         rgb = load_rgb(a.args[0])
         t0 = time.time()
-        blob = with_cpu_fallback(neuro_compress_v7, rgb, a.q, a.ckpt)
+        compress = neuro_compress_v7 if a.flat else neuro_compress_v6
+        blob = with_cpu_fallback(compress, rgb, a.q, a.ckpt)
         open(a.args[1], 'wb').write(blob)
         n = rgb.shape[0] * rgb.shape[1]
         print(f'{a.args[0]} -> {a.args[1]}: {len(blob)} байт '

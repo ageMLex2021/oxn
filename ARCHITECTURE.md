@@ -18,11 +18,12 @@ image
   -> latent: 24 numbers per patch (~32x byte bottleneck)
   -> scaled quantization: round(z*s)/s — a single model covers every
      compression ratio (q 1..100 maps to s on a log scale)
+  -> RATE: adaptive per-patch ladder by default (OXN6), or one flat scale
+     with --flat (OXN7)
   -> HYPERPRIOR: a small conv network predicts the anchor distribution
-  -> OXN7 CONTEXT: four channel groups (6,6,6,6), each coded in two
-     checkerboard passes; a shared context net predicts Gaussian parameters
-     from the hyperprior and all previously decoded channels/positions
-  -> rANS codes the residuals and the hyper-latent
+  -> CONTEXT: OXN6 uses checkerboard spatial context; OXN7 uses four channel
+     groups (6,6,6,6), each coded in two checkerboard passes
+  -> rANS codes the residuals, hyper-latent and OXN6 scale map
 ```
 
 The decoder mirrors this; a small conv refinement head smooths patch seams,
@@ -101,14 +102,15 @@ Only the context branch is trained (`python3 ox_neuro.py trainctx
 OXN1–OXN4 files decode exactly as before.
 
 - **OXN5** = flat rate + context (legacy decode).
-- **OXN6** = adaptive per-patch ladder (OXN4) + context (legacy decode). The
-  rate ladder is stored as float16 and the ctx inputs (anchor latent, log s
-  map) are derived from exactly those float16 values.
+- **OXN6** = adaptive per-patch ladder (OXN4) + context; the default format
+  produced by `c in.png out.oxh --q 75` and by the UI. `--boost` accelerates
+  rate selection. The rate ladder is stored as float16 and the ctx inputs
+  (anchor latent, log s map) are derived from exactly those float16 values.
 - **OXN7** = ELIC-style channel groups (6,6,6,6) + checkerboard inside
   each group, one shared ctx net (`ox_ctx7.pt`, unknown channels/positions
-  are zeroed — the zero pattern is deterministic on both ends). This is the
-  only format produced by `c in.png out.oxh --q 75` and by the UI. Train:
-  `trainctx --groups 6,6,6,6`.
+  are zeroed — the zero pattern is deterministic on both ends). This flat-rate
+  format is produced by `c in.png out.oxh --q 75 --flat` or by disabling
+  adaptive mode in the UI. Train: `trainctx --groups 6,6,6,6`.
 
 Measured on the Kodak holdout (kodim21–24, never trained on), identical
 PSNR: **OXN5 is 5.7–18.6% smaller than OXN3** (avg −11.9%, gain grows with

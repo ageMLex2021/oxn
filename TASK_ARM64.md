@@ -24,8 +24,9 @@ OX-Neuro — lossy нейрокодек изображений: transformer-ав
 - `ox_ctx7.pt` — контекстная сеть OXN7 (канальные группы 6,6,6,6 + checkerboard).
 - Форматы: OXN1/OXN2 (legacy), OXN3 (hyper, плоский), OXN4 (адаптивная
   лесенка), OXN5 (OXN3+контекст), OXN6 (OXN4+контекст), OXN7 (ELIC-style
-  канальные группы + контекст). Новая упаковка — только OXN7; декодер выбирает
-  любой поддерживаемый формат по magic-байтам.
+  канальные группы + контекст). Новая упаковка — адаптивный OXN6 по умолчанию
+  или плоский OXN7 с `--flat`; декодер выбирает любой поддерживаемый формат по
+  magic-байтам.
 
 Достигнуто на holdout kodim21–24 (эти 4 файла **никогда не обучать**),
 PSNR идентичен:
@@ -135,7 +136,8 @@ python3 ox_neuro.py trainctx --steps 100000 --batch 8 --ctx_hidden 192 \
 ## Полезные команды
 
 ```bash
-python3 ox_neuro.py c in.png out.oxh --q 75 [--verify]  # всегда OXN7
+python3 ox_neuro.py c in.png out.oxh --q 75 [--verify]  # адаптивный OXN6
+python3 ox_neuro.py c in.png out.oxh --q 75 --flat      # плоский OXN7
 python3 ox_neuro.py d in.oxh out.jpg                     # OXN1–OXN7 по magic
 python3 ox_neuro.py trainctx --steps N --ctx_hidden 128 [--groups 6,6,6,6] \
     [--init ox_ctx7.pt.part] --data data/train

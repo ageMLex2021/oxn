@@ -26,6 +26,7 @@ from urllib.parse import quote
 HERE = os.path.dirname(os.path.abspath(__file__))
 OX_NEURO = os.path.join(HERE, 'ox_neuro.py')
 CKPT = os.path.join(HERE, 'ox_neuro.pt')
+CTX = os.path.join(HERE, 'ox_ctx.pt')
 CTX7 = os.path.join(HERE, 'ox_ctx7.pt')
 MAX_UPLOAD = 4 * 1024 * 1024 * 1024  # 4 ГБ
 
@@ -89,7 +90,7 @@ PAGE = r"""<!DOCTYPE html>
 <body>
 <div class="wrap">
   <h1>OX<span class="x">·</span>Neuro Hyper <span id="hw" class="badge cpu">…</span></h1>
-  <div class="sub">neural image compression · OXN7 channel context · hyperprior</div>
+  <div class="sub">neural image compression · adaptive OXN6 / flat OXN7 · hyperprior</div>
 
   <div class="card">
     <div id="drop">
@@ -111,7 +112,12 @@ PAGE = r"""<!DOCTYPE html>
     <div class="row">
       <span style="color:var(--dim)">quality</span>
       <input type="number" id="q" value="100" min="1" max="100">
-      <span style="color:var(--dim)">format OXN7</span>
+      <label style="color:var(--dim)" title="Включено: адаптивная степень по патчам OXN6. Выключено: плоская степень OXN7.">
+        <input type="checkbox" id="ad" checked> adaptive OXN6 (off = flat OXN7)
+      </label>
+      <label style="color:var(--dim)" title="Быстрый выбор адаптивной степени маленькой нейросетью; цена — около 0.5 дБ PSNR">
+        <input type="checkbox" id="bs" checked> boost speed for adaptive
+      </label>
       <label style="color:var(--dim)" title="Не пережимать файлы, чей результат уже есть в папке сохранения; отжать — перезаписывать">
         <input type="checkbox" id="sk" checked> skip existing
       </label>
@@ -168,6 +174,7 @@ drop.ondrop = async e => {
   addFiles(out);
 };
 $('file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
+$('ad').onchange = () => { $('bs').disabled = !$('ad').checked; };
 
 function addFiles(fs) {
   files = files.concat(fs);
@@ -255,6 +262,8 @@ async function run(op) {
       const fd = new FormData();
       fd.append('file', f);
       fd.append('q', $('q').value);
+      fd.append('adaptive', $('ad').checked ? '1' : '0');
+      fd.append('boost', $('bs').checked ? '1' : '0');
       fd.append('verify', $('vf').checked ? '1' : '0');
       try {
         const r = await fetch('/api/' + op, { method: 'POST', body: fd });
@@ -316,10 +325,17 @@ def do_compress(fields, files):
     name, data = files['file']
     if not name.lower().endswith(IMG_EXT):
         raise Skip(name)
-    if not os.path.exists(CKPT) or not os.path.exists(CTX7):
-        raise RuntimeError('no ox_neuro.pt / ox_ctx7.pt model — see README.md')
+    adaptive = fields.get('adaptive', '1') == '1'
+    ctx = CTX if adaptive else CTX7
+    if not os.path.exists(CKPT) or not os.path.exists(ctx):
+        raise RuntimeError(f'no ox_neuro.pt / {os.path.basename(ctx)} model — see README.md')
     q = fields.get('q', '100')
     cmd = [sys.executable, OX_NEURO, 'c', None, None, '--q', q]
+    if adaptive:
+        if fields.get('boost') == '1':
+            cmd.append('--boost')
+    else:
+        cmd.append('--flat')
     if fields.get('verify') == '1':
         cmd.append('--verify')
     with tempfile.TemporaryDirectory(prefix='oxh_') as td:
@@ -433,8 +449,8 @@ def main():
         port = int(sys.argv[sys.argv.index('--port') + 1])
     if '--host' in sys.argv:
         host = sys.argv[sys.argv.index('--host') + 1]
-    if not os.path.exists(CKPT) or not os.path.exists(CTX7):
-        print('warning: no ox_neuro.pt / ox_ctx7.pt — see README.md',
+    if not os.path.exists(CKPT) or not os.path.exists(CTX) or not os.path.exists(CTX7):
+        print('warning: no ox_neuro.pt / ox_ctx.pt / ox_ctx7.pt — see README.md',
               file=sys.stderr)
     print(f'OXH UI: http://{host}:{port}')
     ThreadingHTTPServer((host, port), Handler).serve_forever()
