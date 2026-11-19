@@ -18,12 +18,11 @@ image
   -> latent: 24 numbers per patch (~32x byte bottleneck)
   -> scaled quantization: round(z*s)/s — a single model covers every
      compression ratio (q 1..100 maps to s on a log scale)
-  -> ADAPTIVE rate: every patch picks its own scale from a ladder
-     0.35..8.0 minimizing "distortion + lambda * bits" (bit allocation)
-  -> HYPERPRIOR: a small conv network reads the latent and predicts
-     (mu, b) of a Laplace distribution per token; rANS codes only the
-     residual q - mu with a per-token table
-  -> the scale map and the hyper-latent are rANS-coded too
+  -> HYPERPRIOR: a small conv network predicts the anchor distribution
+  -> OXN7 CONTEXT: four channel groups (6,6,6,6), each coded in two
+     checkerboard passes; a shared context net predicts Gaussian parameters
+     from the hyperprior and all previously decoded channels/positions
+  -> rANS codes the residuals and the hyper-latent
 ```
 
 The decoder mirrors this; a small conv refinement head smooths patch seams,
@@ -87,7 +86,7 @@ and a Sobel (high-pass) training loss preserves edge sharpness.
    over fidelity).
 3. Full CUDA port of the entropy stage.
 
-## OXN5/OXN6 — context entropy model (branch `oxn5-context`, experimental)
+## OXN5/OXN6/OXN7 — context entropy models
 
 Ideas from NLAIC (arXiv:1910.06244) and the checkerboard context model
 (He et al., 2021), applied on top of the frozen OXN3/OXN4 transform: the
@@ -101,23 +100,23 @@ Only the context branch is trained (`python3 ox_neuro.py trainctx
 --steps 40000 --data <images>`); the codec weights are untouched, and
 OXN1–OXN4 files decode exactly as before.
 
-- **OXN5** = flat rate + context: `c in.png out.oxh --q 75 --v5`.
-- **OXN6** = adaptive per-patch ladder (OXN4) + context:
-  `c in.png out.oxh --q 75 --v6` (`--boost` works). The rate ladder is
-  stored as float16 and the ctx inputs (anchor latent, log s map) are
-  derived from exactly those float16 values.
+- **OXN5** = flat rate + context (legacy decode).
+- **OXN6** = adaptive per-patch ladder (OXN4) + context (legacy decode). The
+  rate ladder is stored as float16 and the ctx inputs (anchor latent, log s
+  map) are derived from exactly those float16 values.
 - **OXN7** = ELIC-style channel groups (6,6,6,6) + checkerboard inside
   each group, one shared ctx net (`ox_ctx7.pt`, unknown channels/positions
-  are zeroed — the zero pattern is deterministic on both ends):
-  `c in.png out.oxh --q 75 --v7`. Train: `trainctx --groups 6,6,6,6`.
+  are zeroed — the zero pattern is deterministic on both ends). This is the
+  only format produced by `c in.png out.oxh --q 75` and by the UI. Train:
+  `trainctx --groups 6,6,6,6`.
 
 Measured on the Kodak holdout (kodim21–24, never trained on), identical
 PSNR: **OXN5 is 5.7–18.6% smaller than OXN3** (avg −11.9%, gain grows with
 quality); **OXN6 is 1.5–14.5% smaller than OXN4** (avg −9.5%, gain grows
-towards low bitrates); **OXN7 is a further 3–16% smaller than OXN5**
-(−31% vs OXN3 at q92 — and its ctx net was still mid-training). Decode is
-automatic by magic bytes. Bit-exactness
-rules keeping the rANS stream in sync: the rate scaler is quantized
-(float32 in OXN5, float16 ladder in OXN6) before use, the context net is
-fed the *decoded* (clipped to ±256) anchor latent, and ctx runs CPU fp64
-with mkldnn off, like the hyperprior canon.
+towards low bitrates); after 40K context-training steps **OXN7 is a further
+4.46–15.92% smaller than OXN5** on average at q15/q50/q92 (up to −31% vs OXN3
+at q92). Decode is automatic by magic bytes for OXN1–OXN7. Bit-exactness rules
+keeping the rANS stream in sync: the rate scaler is quantized (float32 in
+OXN5/OXN7, float16 ladder in OXN6) before use, the context net is fed the
+*decoded* (clipped to ±256) latent, and ctx runs CPU fp64 with mkldnn off,
+like the hyperprior canon.

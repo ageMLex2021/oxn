@@ -15,15 +15,17 @@ OX-Neuro — lossy нейрокодек изображений: transformer-ав
 
 ## Состояние репозитория
 
-Ветка **`oxn5-context`** (локальная; **не пушить**, `main` не трогать,
-новые коммиты — только в неё).
+Разработка велась в локальной ветке **`oxn5-context`**; готовый OXN7 и
+обратносовместимый декодер перенесены в **`main`**. Ничего не пушить без
+отдельной инструкции.
 
 - `ox_neuro.pt` — основной кодек (16.9M параметров, latent=24, hyper).
 - `ox_ctx.pt` — контекстная сеть OXN5/OXN6 (checkerboard, hidden=128).
 - `ox_ctx7.pt` — контекстная сеть OXN7 (канальные группы 6,6,6,6 + checkerboard).
 - Форматы: OXN1/OXN2 (legacy), OXN3 (hyper, плоский), OXN4 (адаптивная
   лесенка), OXN5 (OXN3+контекст), OXN6 (OXN4+контекст), OXN7 (ELIC-style
-  канальные группы + контекст). Декодер выбирает формат по magic-байтам.
+  канальные группы + контекст). Новая упаковка — только OXN7; декодер выбирает
+  любой поддерживаемый формат по magic-байтам.
 
 Достигнуто на holdout kodim21–24 (эти 4 файла **никогда не обучать**),
 PSNR идентичен:
@@ -133,10 +135,8 @@ python3 ox_neuro.py trainctx --steps 100000 --batch 8 --ctx_hidden 192 \
 ## Полезные команды
 
 ```bash
-python3 ox_neuro.py c in.png out.oxh --q 75 --v7 [--verify]
-python3 ox_neuro.py c in.png out.oxh --q 75 --v5       # плоский + контекст
-python3 ox_neuro.py c in.png out.oxh --q 75 --v6       # адаптив + контекст
-python3 ox_neuro.py d in.oxh out.jpg                   # формат по magic
+python3 ox_neuro.py c in.png out.oxh --q 75 [--verify]  # всегда OXN7
+python3 ox_neuro.py d in.oxh out.jpg                     # OXN1–OXN7 по magic
 python3 ox_neuro.py trainctx --steps N --ctx_hidden 128 [--groups 6,6,6,6] \
     [--init ox_ctx7.pt.part] --data data/train
 ```
@@ -175,3 +175,11 @@ python3 ox_neuro.py trainctx --steps N --ctx_hidden 128 [--groups 6,6,6,6] \
   OXN7 vs OXN5: q15 −3.3%, q50 −4.3%, q92 −15.1% (средние);
   против OXN3 на q92 суммарно −27…−31%. После дообучения перемерить —
   цифры должны стать лучше.
+- 2026-11-19 (arm64, NVIDIA GB10): C/CUDA-ускоритель пересобран, обязательный
+  bench на `data/kodak/kodim01.png` прошёл. Старых `.oxh` для проверки
+  совместимости с x86 в репозитории нет.
+- 2026-11-19 (arm64): `trainctx` на 40000 шагов завершён (1273 с).
+  OXN7 vs OXN5 на kodim21–24, PSNR идентичен: q15 −4.46%, q50 −5.24%,
+  q92 −15.92% (средние экономии по bpp; до дообучения −3.3/−4.3/−15.1%).
+  Для экспериментов `--ctx_file` теперь задаёт отдельный OXN7-чекпоинт в
+  `trainctx`, `train`, `c`, `d` и `bench`.

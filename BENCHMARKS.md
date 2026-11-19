@@ -86,6 +86,8 @@ Left to right: original, OXN, JPEG, WebP, AVIF, JXL.
 ```bash
 pip install pillow pillow-jxl-plugin pillow-avif-plugin lpips scikit-image torchmetrics
 # images: Kodak kodim21-24
-# OXN encode: python3 ox_neuro.py c in.png out.oxh --q <q> --adaptive
+# Historical OXN4 encode (at commit 11bc847):
+# python3 ox_neuro.py c in.png out.oxh --q <q> --adaptive
+# Current OXN7 encode: python3 ox_neuro.py c in.png out.oxh --q <q>
 # classics: PIL Image.save(..., quality=q) with nearest bpp match
 ```

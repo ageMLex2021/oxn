@@ -13,8 +13,10 @@
 > сохраняйте оригиналы — lossy-нейрокодек не является архивным форматом.
 
 Neural image compressor: transformer autoencoder + variable-rate scaler +
-per-patch adaptive rate + hyperprior entropy model (rANS). Beats JPEG by up to
-+2.9 dB PSNR at matched bitrates below ~0.3 bpp (see `ARCHITECTURE.md`).
+hyperprior and OXN7 channel-group context entropy models (rANS). Beats JPEG by
+up to +2.9 dB PSNR at matched bitrates below ~0.3 bpp (see `ARCHITECTURE.md`).
+New files always use OXN7; decompression remains compatible with OXN1–OXN6 and
+selects the format automatically from its four-byte magic header.
 
 ## Setup (Linux / macOS)
 
@@ -71,12 +73,15 @@ and select that `.bat` as the default app for `.oxh`.
 
 ## Model checkpoints
 
-Both models are in git — no training needed:
+The models are in git — no training needed:
 
 - `ox_neuro.pt` (~67 MB) — the codec itself (autoencoder + hyperprior);
-- `ox_boost.pt` (~0.8 MB) — the small conv predictor for the adaptive
-  **boost** mode (optional; without it boost silently falls back to the
-  full ladder).
+- `ox_ctx7.pt` (~1.1 MB) — the channel-group context model required for OXN7
+  compression and decompression;
+- `ox_ctx.pt` (~1.1 MB) — the context model required only for legacy OXN5/OXN6
+  decompression;
+- `ox_boost.pt` (~0.8 MB) — the small conv predictor retained for adaptive-mode
+  benchmarks; it is not used for new compression.
 
 To retrain the codec from scratch: put training images into `data/train/`
 and run
@@ -111,14 +116,9 @@ python3 ox_ui.py --host 0.0.0.0       # LAN mode: other devices (Windows PC,
 ```
 
 Drag&drop images or whole folders onto the drop zone. Two actions only:
-**Compress** (images -> `.oxh`) and **Decompress** (`.oxh` -> `.jpg`).
-Quality slider 1..100 (100 = best). The **adaptive** checkbox (on by
-default) enables per-patch adaptive rate: noticeably smaller files, but
-much slower on huge images (the decoder runs once per rate candidate).
-**boost speed for adaptive** (on by default) replaces 5 of the 7 decoder
-runs with a small conv predictor (`ox_boost.pt`): ~2.3x faster adaptive at
-the cost of roughly 0.5 dB PSNR. Needs `ox_boost.pt` next to `ox_neuro.pt`.
-Each queued file has an `x` button to remove it before starting.
+**Compress** (images -> OXN7 `.oxh`) and **Decompress** (OXN1–OXN7 `.oxh` ->
+`.jpg`, selected automatically by magic header). Quality slider 1..100
+(100 = best). Each queued file has an `x` button to remove it before starting.
 **skip existing** (on by default) skips files whose result already exists in
 the chosen save folder; uncheck it to overwrite. **verify** (off by default)
 makes the encoder decode the entropy stream back and compare — a safety net
@@ -156,30 +156,26 @@ and run `update-mime-database ~/.local/share/mime`.)
 ## CLI
 
 ```bash
-python3 ox_neuro.py c photo.jpg photo.oxh --q 100 --adaptive
-python3 ox_neuro.py c photo.jpg photo.oxh --q 75 --v5   # context model (needs ox_ctx.pt)
-python3 ox_neuro.py c photo.jpg photo.oxh --q 75 --v6   # adaptive + context (needs ox_ctx.pt)
-python3 ox_neuro.py c photo.jpg photo.oxh --q 75 --v7   # channel groups + context (needs ox_ctx7.pt)
-python3 ox_neuro.py d photo.oxh photo.jpg
-python3 ox_neuro.py bench photo.jpg        # vs JPEG table
+python3 ox_neuro.py c photo.jpg photo.oxh --q 75 [--verify]  # always OXN7
+python3 ox_neuro.py d photo.oxh photo.jpg                   # OXN1–OXN7 by header
+python3 ox_neuro.py bench photo.jpg        # vs JPEG and earlier OXN formats
 ```
 
-On branch `oxn5-context` there are also the experimental OXN5/OXN6 formats
-(context entropy model, −6…−19% / −2…−15% size at the same PSNR vs
-OXN3/OXN4; see `ARCHITECTURE.md` → "OXN5/OXN6"). Train the context branch
-with `python3 ox_neuro.py trainctx --steps 40000 --data <images>`.
+Compression requires `ox_neuro.pt` and `ox_ctx7.pt`. To retrain the OXN7
+context branch, run `python3 ox_neuro.py trainctx --steps 40000 --groups
+6,6,6,6 --data <images>`.
 
 ## Files
 
 | File | Purpose |
 |---|---|
-| `ox_neuro.py` | codec core: model, train/compress/decompress, containers OXN3/OXN4 |
+| `ox_neuro.py` | codec core: OXN7 compression, OXN1–OXN7 decompression, training and benchmarks |
 | `ox.py` | static rANS entropy engine (reference) |
 | `ox.c` / `ox_cuda.cu` / `Makefile` / `ox` | C/CUDA accelerator (`prans`) |
 | `ox_ui.py` | compressor web UI |
 | `oxh_viewer.py` | .oxh viewer |
 | `ox_neuro.pt` | codec checkpoint |
-| `ox_boost.pt` | conv predictor for adaptive boost mode |
-| `ox_ctx.pt` | context entropy model for OXN5/OXN6 (branch `oxn5-context`) |
-| `ox_ctx7.pt` | channel-group context model for OXN7 (branch `oxn5-context`) |
-| `TASK_ARM64.md` | handoff: перенос обучения на arm64 (branch `oxn5-context`) |
+| `ox_boost.pt` | conv predictor for adaptive-mode benchmarks |
+| `ox_ctx.pt` | context entropy model for legacy OXN5/OXN6 decompression |
+| `ox_ctx7.pt` | channel-group context model for OXN7 |
+| `TASK_ARM64.md` | handoff: перенос обучения на arm64 |

@@ -5,13 +5,13 @@ OX-Neuro — learned image codec (lossy): a transformer autoencoder trained
 to reconstruct itself; the compression ratio is set by a latent SCALER s:
 z -> round(z*s)/s. One model covers the whole quality range.
 
-Entropy coding: static rANS from ox.py per latent channel; with --hyper a
-hypernetwork predicts a per-token Laplace (mu, b) and rANS codes only the
-residual (parametric rANS, optionally via the C accelerator `ox prans`).
+Entropy coding: OXN7 combines a hyperprior with channel-group/checkerboard
+context and parametric rANS (optionally via the C accelerator `ox prans`).
+Decompression auto-detects OXN1–OXN7 by magic header.
 
 Usage:
   python3 ox_neuro.py train [--steps 40000] [--data data/train]
-  python3 ox_neuro.py c in.png out.oxh [--q 100] [--adaptive]
+  python3 ox_neuro.py c in.png out.oxh [--q 100] [--verify]
   python3 ox_neuro.py d in.oxh out.jpg
   python3 ox_neuro.py bench in.png
 """
@@ -1982,7 +1982,7 @@ def cmd_trainctx(args):
         if sum(groups) != C:
             sys.exit(f'--groups {groups} не сходятся с latent={C}')
         ctx = _build_ctx7(C, args.ctx_hidden).to(dev)
-        out_file = CTX7_FILE
+        out_file = args.ctx_file
     else:
         ctx = _build_ctx(C, args.ctx_hidden).to(dev)
         out_file = CTX_FILE
@@ -2278,6 +2278,7 @@ def cmd_bench(args):
 
 
 def main():
+    global CTX7_FILE
     ap = argparse.ArgumentParser(description='OX-Neuro — learned image codec')
     ap.add_argument('cmd', choices=['train', 'trainctx', 'c', 'd', 'bench'])
     ap.add_argument('args', nargs='*')
@@ -2306,7 +2307,7 @@ def main():
                     help='train: совместный ретрен с OXN7-энтропией в лоссе '
                          '(нужен обученный ox_ctx7.pt)')
     ap.add_argument('--ctx_file', default=CTX7_FILE,
-                    help='train --ctx7: файл контекстной сети (in/out)')
+                    help='файл OXN7-контекста (train/trainctx/c/d/bench)')
     ap.add_argument('--w_hp', type=float, default=0.0,
                     help='high-pass loss weight (Sobel, sharpness)')
     ap.add_argument('--init', default=None, help='checkpoint to fine-tune from')
@@ -2317,34 +2318,18 @@ def main():
                     help='fine-tune decoder only (encoder/quantizer frozen)')
     ap.add_argument('--out', default=CKPT, help='where to save the checkpoint (train)')
     ap.add_argument('--ckpt', default=None, help='checkpoint for c/d/bench')
-    ap.add_argument('--adaptive', action='store_true',
-                    help='per-patch adaptive rate (OXN2/OXN4)')
     ap.add_argument('--verify', action='store_true',
                     help='после сжатия декодировать энтропийный поток обратно '
                          'и сверить (медленно на больших изображениях)')
-    ap.add_argument('--boost', action='store_true',
-                    help='adaptive: степень по патчам выбирает маленькая '
-                         'conv-сеть (ox_boost.pt) вместо 7 прогонов декодера')
-    ap.add_argument('--v5', action='store_true',
-                    help='формат OXN5: checkerboard-контекст + Гаусс '
-                         '(нужен обученный ox_ctx.pt, см. trainctx)')
-    ap.add_argument('--v6', action='store_true',
-                    help='формат OXN6: адаптивная степень по патчам + '
-                         'контекст (нужен ox_ctx.pt; --boost работает)')
-    ap.add_argument('--v7', action='store_true',
-                    help='формат OXN7: канальные группы (ELIC) + контекст '
-                         '(нужен ox_ctx7.pt, см. trainctx --groups)')
     ap.add_argument('--groups', default='',
                     help='trainctx: канальные группы для OXN7, напр. 6,6,6,6')
     ap.add_argument('--ctx_hidden', type=int, default=CTX_HIDDEN,
                     help='ширина контекстной сети (trainctx)')
     a = ap.parse_args()
+    CTX7_FILE = a.ctx_file
     if a.verify:
         global _VERIFY
         _VERIFY = True
-    if a.boost:
-        global _BOOST_ON
-        _BOOST_ON = True
 
     def with_cpu_fallback(fn, *fargs):
         """При нехватке VRAM — повтор на CPU (в RAM)."""
@@ -2372,16 +2357,7 @@ def main():
         from PIL import Image
         rgb = load_rgb(a.args[0])
         t0 = time.time()
-        if a.v7:
-            blob = with_cpu_fallback(neuro_compress_v7, rgb, a.q, a.ckpt)
-        elif a.v6:
-            blob = with_cpu_fallback(neuro_compress_v6, rgb, a.q, a.ckpt)
-        elif a.v5:
-            blob = with_cpu_fallback(neuro_compress_v5, rgb, a.q, a.ckpt)
-        elif a.adaptive:
-            blob = with_cpu_fallback(neuro_compress_adaptive, rgb, a.q, a.ckpt)
-        else:
-            blob = with_cpu_fallback(neuro_compress, rgb, a.q, a.ckpt)
+        blob = with_cpu_fallback(neuro_compress_v7, rgb, a.q, a.ckpt)
         open(a.args[1], 'wb').write(blob)
         n = rgb.shape[0] * rgb.shape[1]
         print(f'{a.args[0]} -> {a.args[1]}: {len(blob)} байт '
