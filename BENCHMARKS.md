@@ -47,6 +47,23 @@ via Pillow for the rest. OXN encode uses adaptive rate (best quality mode).
 On a 201 MP photo OXN adaptive encode is ~110 s (GPU). CLI startup
 (torch init + model load) adds ~10 s if the codec runs as a fresh process.
 
+## OXN8-fast on ARM64 / NVIDIA GB10
+
+Same 2880×2160 image, q50, before/after the native and adaptive optimizations:
+
+| mode | stage | before | after |
+|---|---|---:|---:|
+| adaptive | encode | 11.07 s | **4.97 s** |
+| flat | encode | 4.15 s | **2.18 s** |
+| flat | decode | 3.51 s | **1.76 s** |
+
+The flat bitstream is unchanged. The native library caches CDF/LUT tables,
+replaces Python rANS and element-wise Q20.12 operations, batches the adaptive
+decoder ladder and keeps reconstruction decoding in BF16 on CUDA. UI/viewer
+model loading is reused between files. These timings are a local engineering
+checkpoint, not the target 10× result; model distillation requires the absent
+`data/` training and holdout sets.
+
 ## The flip side: size at matched quality
 
 Same data, read the other way - how many bits do others need to match OXN?

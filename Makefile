@@ -13,14 +13,16 @@ all:
 	fi
 
 cpu: ox.c
+	$(CC) $(CFLAGS) -fPIC -shared -o libox.so ox.c
 	$(CC) $(CFLAGS) -o ox ox.c
 
 gpu: ox.c ox_cuda.cu
 	$(NVCC) -O3 -arch=native -c ox_cuda.cu -o ox_cuda.o
+	$(CC) $(CFLAGS) -fPIC -shared -o libox.so ox.c
 	$(CC) $(CFLAGS) -DOX_CUDA -c ox.c -o ox_main.o
 	$(CC) $(CFLAGS) -o ox ox_main.o ox_cuda.o -L$(CUDA)/lib64 -lcudart -lstdc++
 
 clean:
-	rm -f ox ox_main.o ox_cuda.o
+	rm -f ox libox.so ox_main.o ox_cuda.o
 
 .PHONY: all cpu gpu clean

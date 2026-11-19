@@ -12,11 +12,11 @@ skipped silently. GPU is used automatically; on VRAM exhaustion the codec
 falls back to CPU (inside ox_neuro.py).
 """
 
+import io
 import json
 import os
-import subprocess
 import sys
-import tempfile
+import threading
 import time
 from email.parser import BytesParser
 from email.policy import default as email_policy
@@ -29,6 +29,8 @@ CKPT = os.path.join(HERE, 'ox_neuro.pt')
 CTX7 = os.path.join(HERE, 'ox_ctx7.pt')
 CANON8 = os.path.join(HERE, 'oxn8_canon.npz')
 MAX_UPLOAD = 4 * 1024 * 1024 * 1024  # 4 ГБ
+_CODEC = None
+_CODEC_LOCK = threading.Lock()
 
 IMG_EXT = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff')
 
@@ -321,6 +323,26 @@ class Skip(Exception):
     """Unsupported format — skipped silently (HTTP 415)."""
 
 
+def _codec():
+    global _CODEC
+    if _CODEC is None:
+        import ox_neuro
+        _CODEC = ox_neuro
+    return _CODEC
+
+
+def _codec_call(ox, fn, *args):
+    try:
+        return fn(*args)
+    except Exception as e:
+        if 'CUDA' not in str(e) or 'memory' not in str(e) or ox._FORCE_CPU:
+            raise
+        ox._FORCE_CPU = True
+        import torch
+        torch.cuda.empty_cache()
+        return fn(*args)
+
+
 def do_compress(fields, files):
     name, data = files['file']
     if not name.lower().endswith(IMG_EXT):
@@ -329,27 +351,17 @@ def do_compress(fields, files):
     if (not os.path.exists(CKPT) or not os.path.exists(CTX7)
             or not os.path.exists(CANON8)):
         raise RuntimeError('no ox_neuro.pt / ox_ctx7.pt / oxn8_canon.npz — see README.md')
-    q = fields.get('q', '100')
-    cmd = [sys.executable, OX_NEURO, 'c', None, None, '--q', q]
-    if adaptive:
-        if fields.get('boost') == '1':
-            cmd.append('--boost')
-    else:
-        cmd.append('--flat')
-    if fields.get('verify') == '1':
-        cmd.append('--verify')
-    with tempfile.TemporaryDirectory(prefix='oxh_') as td:
-        src = os.path.join(td, name)
-        dst = src + '.oxh'
-        cmd[3], cmd[4] = src, dst
-        with open(src, 'wb') as f:
-            f.write(data)
-        t0 = time.time()
-        r = subprocess.run(cmd, capture_output=True, timeout=86400)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.decode('utf-8', 'replace')[-400:])
-        out = open(dst, 'rb').read()
-        dt = time.time() - t0
+    q = int(fields.get('q', '100'))
+    ox = _codec()
+    from PIL import Image, ImageOps
+    rgb = ox.np.asarray(ImageOps.exif_transpose(
+        Image.open(io.BytesIO(data))).convert('RGB'))
+    t0 = time.time()
+    with _CODEC_LOCK:
+        ox._BOOST_ON = adaptive and fields.get('boost') == '1'
+        ox._VERIFY = fields.get('verify') == '1'
+        out = _codec_call(ox, ox.neuro_compress_v8, rgb, q, None, not adaptive)
+    dt = time.time() - t0
     n, on = len(data), len(out)
     stats = {
         'in': n, 'out': on,
@@ -368,18 +380,15 @@ def do_decompress(fields, files):
             b'OXN8'):
         raise Skip(name)
     base = name[:-4]
-    with tempfile.TemporaryDirectory(prefix='oxh_') as td:
-        src = os.path.join(td, name)
-        dst = os.path.join(td, base + '.jpg')
-        with open(src, 'wb') as f:
-            f.write(data)
-        t0 = time.time()
-        r = subprocess.run([sys.executable, OX_NEURO, 'd', src, dst],
-                           capture_output=True, timeout=86400)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.decode('utf-8', 'replace')[-400:])
-        out = open(dst, 'rb').read()
-        dt = time.time() - t0
+    ox = _codec()
+    t0 = time.time()
+    with _CODEC_LOCK:
+        rec = _codec_call(ox, ox.neuro_decompress, data)
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.fromarray(rec).save(buf, 'JPEG', quality=95, subsampling=0)
+    out = buf.getvalue()
+    dt = time.time() - t0
     stats = {'in': len(data), 'out': len(out), 'time': round(dt, 1),
              'out_name': base + '.jpg'}
     return out, stats

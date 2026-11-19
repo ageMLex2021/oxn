@@ -690,6 +690,11 @@ def _maybe_autocast(dev, npix):
                           enabled=(dev == 'cuda' and npix > 16_000_000))
 
 
+def _decode_autocast(dev):
+    import torch
+    return torch.autocast('cuda', dtype=torch.bfloat16, enabled=(dev == 'cuda'))
+
+
 _FORCE_CPU = False     # после CUDA OOM переключаемся на CPU насовсем
 _VERIFY = False        # самопроверка энтропийного потока после сжатия (--verify)
 
@@ -782,26 +787,93 @@ def _canon8():
 
 # Ускорение: параметрический rANS через C-бинарник ox (с fallback на Python)
 OX_BIN = os.path.join(HERE, 'ox')
+_PRANS_TABLES = None
+_PRANS_LEGACY = False
+_PRANS_NATIVE = None
+_PRANS_NATIVE_LEGACY = False
+
+
+def _prans_tables(legacy=True):
+    global _PRANS_TABLES, _PRANS_LEGACY
+    if _PRANS_TABLES is None:
+        _PRANS_TABLES = np.zeros((4 * N_BUCK, 513), dtype='<u4')
+        _PRANS_TABLES[2 * N_BUCK:] = _canon8()['tables']
+    if legacy and not _PRANS_LEGACY:
+        _PRANS_TABLES[:2 * N_BUCK] = np.stack(
+            [_lap_table(i) for i in range(N_BUCK)]
+            + [_gauss_table(i) for i in range(N_BUCK)])
+        _PRANS_LEGACY = True
+    return _PRANS_TABLES
+
+
+def _prans_native(legacy=False):
+    global _PRANS_NATIVE, _PRANS_NATIVE_LEGACY
+    if _PRANS_NATIVE is None:
+        try:
+            import ctypes
+            lib = ctypes.CDLL(os.path.join(HERE, 'libox.so'))
+            tables = _prans_tables(legacy)
+            lut = np.empty((len(tables), RT), dtype='<u2')
+            lib.ox_prans_make_lut.argtypes = [ctypes.c_void_p, ctypes.c_uint32,
+                                              ctypes.c_void_p]
+            lib.ox_prans_make_lut.restype = None
+            lib.ox_prans_make_lut(tables.ctypes.data, len(tables), lut.ctypes.data)
+            _PRANS_NATIVE_LEGACY = legacy
+            lib.ox_prans_encode.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_uint32,
+                ctypes.c_void_p, ctypes.c_size_t, ctypes.POINTER(ctypes.c_size_t)]
+            lib.ox_prans_encode.restype = ctypes.c_int
+            lib.ox_prans_decode.argtypes = [
+                ctypes.c_void_p, ctypes.c_void_p, ctypes.c_void_p, ctypes.c_size_t,
+                ctypes.c_void_p, ctypes.c_uint32, ctypes.c_void_p,
+                ctypes.POINTER(ctypes.c_uint32)]
+            lib.ox_prans_decode.restype = ctypes.c_int
+            lib.oxn8_requant.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                         ctypes.c_void_p]
+            lib.oxn8_requant.restype = ctypes.c_int
+            lib.oxn8_gelu.argtypes = [ctypes.c_void_p, ctypes.c_size_t,
+                                      ctypes.c_void_p, ctypes.c_size_t]
+            lib.oxn8_gelu.restype = None
+            _PRANS_NATIVE = (lib, tables, lut)
+        except Exception:
+            _PRANS_NATIVE = False
+            print('OXN: libox.so unavailable; using subprocess/Python rANS',
+                  file=sys.stderr)
+    if _PRANS_NATIVE and legacy and not _PRANS_NATIVE_LEGACY:
+        lib, tables, lut = _PRANS_NATIVE
+        _prans_tables(True)
+        lib.ox_prans_make_lut(tables.ctypes.data, len(tables), lut.ctypes.data)
+        _PRANS_NATIVE_LEGACY = True
+    return _PRANS_NATIVE or None
 
 
 def _prans_tables_file(td):
     """Все бакет-таблицы в бинарник: [u32 K][K x 513 x u32 cum LE].
     0..23 — legacy Лаплас, 24..47 — legacy Гаусс; 48..95 — такие же
     распределения из замороженного канона OXN8."""
-    tabs = np.concatenate([
-        np.stack([_lap_table(i) for i in range(N_BUCK)]
-                 + [_gauss_table(i) for i in range(N_BUCK)]),
-        _canon8()['tables'],
-    ])
+    tabs = _prans_tables()
     path = os.path.join(td, 'tables.bin')
     with open(path, 'wb') as f:
         f.write(struct.pack('<I', 4 * N_BUCK))
-        f.write(tabs.astype('<u4').tobytes())
+        f.write(tabs.tobytes())
     return path
 
 
 def rans_enc_param_fast(symbols, bids):
-    """C-версия rans_enc_param через subprocess; None при неудаче."""
+    """C-версия rans_enc_param; None при неудаче."""
+    native = _prans_native(bool(np.any(np.asarray(bids) < 2 * N_BUCK)))
+    if native is not None:
+        import ctypes
+        lib, tables, _ = native
+        sym = np.ascontiguousarray(symbols, dtype='<u2')
+        b = np.ascontiguousarray(bids, dtype=np.uint8)
+        out = np.empty(2 * len(sym) + 16, dtype=np.uint8)
+        out_n = ctypes.c_size_t()
+        rc = lib.ox_prans_encode(tables.ctypes.data, sym.ctypes.data,
+                                 b.ctypes.data, len(sym), out.ctypes.data,
+                                 len(out), ctypes.byref(out_n))
+        if rc == 0:
+            return out[:out_n.value].tobytes()
     import subprocess
     import tempfile
     try:
@@ -823,9 +895,22 @@ def rans_enc_param_fast(symbols, bids):
 
 
 def rans_dec_param_fast(blob, bids):
-    """C-версия rans_dec_param через subprocess; None при неудаче.
+    """C-версия rans_dec_param; None при неудаче.
     Возвращает (symbols, consumed): consumed == len(blob), если бакеты
     совпали с энкодером; иначе поток десинхронизирован."""
+    native = _prans_native(bool(np.any(np.asarray(bids) < 2 * N_BUCK)))
+    if native is not None:
+        import ctypes
+        lib, tables, lut = native
+        raw = np.frombuffer(blob, dtype=np.uint8)
+        b = np.ascontiguousarray(bids, dtype=np.uint8)
+        out = np.empty(len(b), dtype='<u2')
+        used = ctypes.c_uint32()
+        rc = lib.ox_prans_decode(tables.ctypes.data, lut.ctypes.data,
+                                 raw.ctypes.data, len(raw), b.ctypes.data,
+                                 len(b), out.ctypes.data, ctypes.byref(used))
+        if rc == 0:
+            return out.astype(np.int32), used.value
     import subprocess
     import tempfile
     try:
@@ -1193,7 +1278,7 @@ def _run_decode(model, z, Hp, Wp, lg, dev):
     ht, wt = Hp // p, Wp // p
     band = 128
     if ht <= band:
-        with torch.no_grad(), _maybe_autocast(dev, Hp * Wp):
+        with torch.no_grad(), _decode_autocast(dev):
             xr = model.decode(z, Hp, Wp, lg)
         return xr[0].permute(1, 2, 0).float().cpu().numpy()
     ov = 16
@@ -1203,11 +1288,41 @@ def _run_decode(model, z, Hp, Wp, lg, dev):
         a, b = max(y0 - ov, 0), min(y1 + ov, ht)
         zb = z[:, a * wt:b * wt]
         lb = lg[:, a * wt:b * wt] if lg is not None else None
-        with torch.no_grad(), _maybe_autocast(dev, Hp * Wp):
+        with torch.no_grad(), _decode_autocast(dev):
             xb = model.decode(zb, (b - a) * p, Wp, lb)
         canvas[y0 * p:y1 * p] = \
             xb[0].permute(1, 2, 0).float().cpu().numpy()[(y0 - a) * p:(y1 - a) * p]
     return canvas
+
+
+def _run_decode_patch_mse(model, z, Hp, Wp, lg, canvas, dev):
+    import torch
+    p = model.patch
+    ht, wt = Hp // p, Wp // p
+    B = z.shape[0]
+    target = torch.from_numpy(canvas).permute(2, 0, 1)[None].to(dev)
+    band = 128
+    if ht <= band:
+        with torch.no_grad(), _decode_autocast(dev):
+            xr = model.decode(z, Hp, Wp, lg)
+        d = ((xr.float() - target) ** 2).mean(1)
+        d = d.reshape(B, ht, p, wt, p).mean(axis=(2, 4)) * 65025.0
+        return d.reshape(B, -1).cpu().numpy()
+    ov = 16
+    out = np.empty((B, ht * wt), np.float32)
+    for y0 in range(0, ht, band):
+        y1 = min(y0 + band, ht)
+        a, b = max(y0 - ov, 0), min(y1 + ov, ht)
+        zb = z[:, a * wt:b * wt]
+        lb = lg[:, a * wt:b * wt] if lg is not None else None
+        with torch.no_grad(), _decode_autocast(dev):
+            xb = model.decode(zb, (b - a) * p, Wp, lb)
+        tb = target[:, :, a * p:b * p]
+        d = ((xb.float() - tb) ** 2).mean(1)
+        d = d[:, (y0 - a) * p:(y1 - a) * p]
+        d = d.reshape(B, y1 - y0, p, wt, p).mean(axis=(2, 4)) * 65025.0
+        out[:, y0 * wt:y1 * wt] = d.reshape(B, -1).cpu().numpy()
+    return out
 
 
 def neuro_compress(rgb, q=75, ckpt=None):
@@ -2020,6 +2135,13 @@ def _qdequant_latent(q_lat, scales_q):
 
 def _qgelu(x):
     import torch
+    native = _prans_native()
+    if native is not None:
+        lib, _, _ = native
+        xa = x.numpy()
+        lut = np.ascontiguousarray(_canon8()['gelu'], dtype=np.int64)
+        lib.oxn8_gelu(xa.ctypes.data, xa.size, lut.ctypes.data, len(lut))
+        return x
     lut = torch.from_numpy(_canon8()['gelu'].astype(np.int64))
     pos = x + 8 * Q8_FSCALE
     idx = torch.clamp(pos >> 4, 0, lut.numel() - 2)
@@ -2048,13 +2170,23 @@ def _qnet_copy(net):
 def _qnet_run(layers, x):
     import torch
     import torch.nn as nn
+    native = _prans_native()
     for layer in layers:
         if isinstance(layer, (nn.Conv2d, nn.ConvTranspose2d)):
             raw = layer(x.to('cpu', torch.float64))
-            if not torch.isfinite(raw).all():
-                raise RuntimeError('OXN8 integer convolution overflow')
-            x = _qround_shift(raw.to(torch.int64), Q8_WBITS)
-            x = torch.clamp(x, -Q8_MAX, Q8_MAX)
+            if native is not None:
+                lib, _, _ = native
+                raw_np = raw.detach().numpy()
+                out = np.empty(raw_np.shape, dtype=np.int64)
+                if lib.oxn8_requant(raw_np.ctypes.data, raw_np.size,
+                                    out.ctypes.data):
+                    raise RuntimeError('OXN8 integer convolution overflow')
+                x = torch.from_numpy(out)
+            else:
+                if not torch.isfinite(raw).all():
+                    raise RuntimeError('OXN8 integer convolution overflow')
+                x = _qround_shift(raw.to(torch.int64), Q8_WBITS)
+                x = torch.clamp(x, -Q8_MAX, Q8_MAX)
         elif isinstance(layer, nn.GELU):
             x = _qgelu(x)
         else:
@@ -2086,6 +2218,22 @@ def _qhyper_encode(model, zqd_q, ht, wt):
     mu_q, logb_q = mb.chunk(2, -1)
     wq = w[0].reshape(w.shape[1], -1).transpose(0, 1)
     return (wq.numpy().astype(np.int32), mu_q.numpy(), logb_q.numpy())
+
+
+def _hyper_rate_estimate(model, zqd_q, ht, wt, dev):
+    import torch
+    C = zqd_q.shape[1]
+    grid = torch.from_numpy(zqd_q.T.reshape(1, C, ht, wt).astype(np.float32)
+                            / Q8_FSCALE).to(dev)
+    ph, pw = (-ht) % 4, (-wt) % 4
+    gpad = torch.nn.functional.pad(grid, (0, pw, 0, ph), mode='replicate')
+    with torch.no_grad():
+        w = model.hyper_enc(gpad)
+        mb = model.hyper_dec(torch.round(w))
+    mb = mb[:, :, :ht, :wt].reshape(1, 2 * C, -1)[0].transpose(0, 1)
+    mu, logb = mb.chunk(2, -1)
+    return (np.round(mu.float().cpu().numpy()).astype(np.int64),
+            logb.float().cpu().numpy())
 
 
 def _qhyper_decode(model, w, ht, wt):
@@ -2172,13 +2320,12 @@ def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False):
         s0_q = np.array([round(float(np.float32(s0)) * 256)], np.int64)
         q0 = np.round(zs * (s0_q[0] / 256.0)).astype(np.int64)
         zqd0_q = _qdequant_latent(q0, np.full(T_, s0_q[0], np.int64))
-        _, mu0_q, logb0_q = _qhyper_encode(model, zqd0_q, ht, wt)
-        mu0r = _qround_shift(mu0_q, Q8_FBITS)
-        logb0 = logb0_q.astype(np.float64) / Q8_FSCALE
+        mu0r, logb0 = _hyper_rate_estimate(model, zqd0_q, ht, wt, dev)
         b0 = np.log1p(np.exp(logb0)) + 1e-2
         Dk, Rk, Qk, Ek = [], [], [], []
         use_boost = _BOOST_ON and _boost_net(dev) is not False
         mid = _boost_net(dev)[3] if use_boost else []
+        need = []
         for k, s in enumerate(scales):
             sf = float(s)
             qk = np.round(zs * sf)
@@ -2187,12 +2334,19 @@ def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False):
             if use_boost:
                 Ek.append(((zs * sf - qk) ** 2).mean(axis=1))
             if not use_boost or k in mid:
-                zt = torch.from_numpy((qk / sf).astype(np.float32))[None].to(dev)
-                lg = torch.full((1, T_), math.log(sf), device=dev)
-                xrn = _run_decode(model, zt, Hp, Wp, lg, dev)
-                d = ((xrn - canvas) ** 2).mean(2)
-                Dk.append(d.reshape(ht, p, wt, p).mean(axis=(1, 3)).reshape(-1)
-                          * 65025.0)
+                need.append(k)
+        per_image = max(Hp * Wp * 400, 1)
+        batch = int(np.clip(_mem_budget(dev) // per_image, 1, len(need)))
+        if dev != 'cuda':
+            batch = 1
+        for first in range(0, len(need), batch):
+            ids = need[first:first + batch]
+            zb = np.stack([(Qk[k] / float(scales[k])).astype(np.float32)
+                           for k in ids])
+            zt = torch.from_numpy(zb).to(dev)
+            lg = torch.from_numpy(np.log(scales[ids]).astype(np.float32))[:, None]
+            lg = lg.expand(len(ids), T_).to(dev)
+            Dk.extend(_run_decode_patch_mse(model, zt, Hp, Wp, lg, canvas, dev))
         if use_boost:
             D = _boost_predict(model, canvas, zs, np.stack(Ek), np.stack(Rk),
                                np.stack(Dk), ht, wt, p, dev)

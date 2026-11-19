@@ -195,4 +195,13 @@ python3 ox_neuro.py trainctx --steps N --ctx_hidden 128 [--groups 6,6,6,6] \
   байты. Conv2d/ConvTranspose2d сверены с независимыми int64-циклами. На
   kodim21–24 q50: adaptive 34883 байт против 37920 у OXN6 (−8.0%), flat
   57889 против 57854 у OXN7 (+0.06%), PSNR практически совпадает. Реальный
-  x86↔ARM обмен OXN8 ещё нужно выполнить как финальную приёмку.
+  x86↔ARM обмен OXN8 пользователь подтвердил как работающий.
+- 2026-11-19 (arm64, NVIDIA GB10): OXN8-fast без смены формата: native libox.so
+  для rANS/requant/GELU, кэш CDF/LUT и ленивые legacy-таблицы, batched adaptive
+  ladder, GPU rate estimate только для encoder-side выбора, BF16 reconstruction
+  decoder, persistent UI/viewer. На 2880×2160 adaptive encode 11.07→4.97 с,
+  flat encode 4.15→2.18 с, flat decode 3.51→1.76 с; flat bitstream и PSNR
+  сохранены. Реальное фото 201 Мп: adaptive encode 82.77 с с --verify, decode
+  44.31 с включая fresh process, roundtrip успешен. Для OXN9 distillation на
+  машине отсутствует каталог data/ — обучение и kodim21–24 RD-приёмку нужно
+  продолжить после восстановления датасета.

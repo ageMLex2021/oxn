@@ -11,10 +11,9 @@ skipped silently.
 For "double-click on .oxh" association see oxh-viewer.desktop and README.md.
 """
 
+import io
 import os
-import subprocess
 import sys
-import tempfile
 import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -25,6 +24,7 @@ OX_NEURO = os.path.join(HERE, 'ox_neuro.py')
 
 ROOT = os.getcwd()          # ограничимся папкой первого файла
 _cache = {}                 # path -> (mtime, size, bytes jpg)
+_codec_lock = threading.Lock()
 
 PAGE = r"""<!DOCTYPE html>
 <html lang="ru">
@@ -151,13 +151,23 @@ def decode_oxh(path):
     key = (st.st_mtime, st.st_size)
     if path in _cache and _cache[path][0] == key:
         return _cache[path][1]
-    with tempfile.TemporaryDirectory(prefix='oxhv_') as td:
-        dst = os.path.join(td, 'out.jpg')
-        r = subprocess.run([sys.executable, OX_NEURO, 'd', path, dst],
-                           capture_output=True, timeout=86400)
-        if r.returncode != 0:
-            raise RuntimeError(r.stderr.decode('utf-8', 'replace')[-300:])
-        data = open(dst, 'rb').read()
+    with open(path, 'rb') as f:
+        blob = f.read()
+    import ox_neuro
+    with _codec_lock:
+        try:
+            rec = ox_neuro.neuro_decompress(blob)
+        except Exception as e:
+            if 'CUDA' not in str(e) or 'memory' not in str(e):
+                raise
+            ox_neuro._FORCE_CPU = True
+            import torch
+            torch.cuda.empty_cache()
+            rec = ox_neuro.neuro_decompress(blob)
+    from PIL import Image
+    buf = io.BytesIO()
+    Image.fromarray(rec).save(buf, 'JPEG', quality=95, subsampling=0)
+    data = buf.getvalue()
     _cache.clear()
     _cache[path] = (key, data)
     return data

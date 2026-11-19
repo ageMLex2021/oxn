@@ -58,10 +58,12 @@ and a Sobel (high-pass) training loss preserves edge sharpness.
   (VRAM/RAM), correct on unified-memory systems (DGX Spark, Jetson);
   automatic CPU retry on VRAM exhaustion.
 - EXIF orientation honored on load.
-- Entropy stage accelerated by a C module (bit-identical to the Python
-  reference; automatic fallback). The C decoder also reports how many stream
-  bytes were consumed: a mismatch with the stream length means the hyperprior
-  tables did not match the encoder.
+- Entropy stage accelerated by a native C library (bit-identical to the Python
+  reference; automatic subprocess/Python fallback). Canonical tables and the
+  slot-to-symbol LUT are cached once per process; legacy tables load lazily.
+  Native Q20.12 requantization and GELU preserve the integer canon. The C decoder
+  also reports how many stream bytes were consumed: a mismatch with the stream
+  length means the hyperprior tables did not match the encoder.
 - OXN8 bit-exact entropy: hyperprior/context weights and activations use Q20.12
   integers. Convolution kernels process integer-valued float64 tensors whose
   products and partial sums stay below 2^53, making accumulation exact regardless
@@ -151,8 +153,13 @@ required for integer conversion.
   table or residual center follows the integer canon.
 - C and Python parametric rANS produce identical OXN8 bytes for identical
   latents. GPU-encoded files pass fresh-process GPU and CPU-only decodes with
-  `--verify`. Actual x86↔ARM exchange is still required as a final cross-machine
-  acceptance test.
+  `--verify`; the user has also confirmed actual x86↔ARM exchange.
+- The UI and viewer keep the codec loaded between files. Adaptive encoding
+  batches decoder-ladder candidates within the memory budget and uses a GPU
+  floating-point estimate only for encoder-side rate selection; the final
+  entropy path remains integer Q20.12. Reconstruction decoding uses BF16 on
+  CUDA, while encoder latents stay FP32 at ordinary sizes to avoid a bitrate
+  regression.
 
 At q50 on kodim21–24, with `--verify`, OXN8 adaptive totals **34,883 bytes vs
 37,920 for OXN6** (−8.0% total) at essentially equal PSNR (per-image changes

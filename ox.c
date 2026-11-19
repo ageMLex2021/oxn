@@ -31,6 +31,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <math.h>
 
 #define SCALE   12
 #define T       (1u << SCALE)
@@ -573,6 +574,97 @@ static uint8_t *ox_decompress(const uint8_t *blob, size_t blob_n,
  */
 static uint8_t *read_file(const char *path, size_t *n);
 static void write_file(const char *path, const uint8_t *d, size_t n);
+
+void ox_prans_make_lut(const uint32_t *cums, uint32_t k, uint16_t *lut) {
+    for (uint32_t b = 0; b < k; b++) {
+        const uint32_t *cum = cums + (size_t)b * 513;
+        for (uint32_t s = 0; s < 512; s++)
+            for (uint32_t j = cum[s]; j < cum[s + 1]; j++)
+                lut[(size_t)b * T + j] = (uint16_t)s;
+    }
+}
+
+int ox_prans_encode(const uint32_t *cums, const uint16_t *sym,
+                    const uint8_t *bid, uint32_t n, uint8_t *out,
+                    size_t cap, size_t *out_n) {
+    uint8_t *tmp = malloc(2 * (size_t)n + 16);
+    if (!tmp) return 1;
+    size_t tp = 0;
+    uint32_t x = RANS_L;
+    for (uint32_t i = n; i-- > 0; ) {
+        const uint32_t *cum = cums + (size_t)bid[i] * 513;
+        uint32_t s = sym[i];
+        uint32_t f = cum[s + 1] - cum[s], c = cum[s];
+        uint32_t x_max = ((RANS_L >> SCALE) << 8) * f;
+        while (x >= x_max) { tmp[tp++] = (uint8_t)(x & 0xFF); x >>= 8; }
+        x = ((x / f) << SCALE) + (x % f) + c;
+    }
+    if (4 + tp > cap) { free(tmp); return 2; }
+    out[0] = (uint8_t)(x >> 24); out[1] = (uint8_t)(x >> 16);
+    out[2] = (uint8_t)(x >> 8); out[3] = (uint8_t)x;
+    for (size_t i = 0; i < tp; i++) out[4 + i] = tmp[tp - 1 - i];
+    *out_n = 4 + tp;
+    free(tmp);
+    return 0;
+}
+
+int ox_prans_decode(const uint32_t *cums, const uint16_t *lut,
+                    const uint8_t *blob, size_t blob_n, const uint8_t *bids,
+                    uint32_t n, uint16_t *out, uint32_t *consumed) {
+    if (blob_n < 4) return 1;
+    uint32_t x = ((uint32_t)blob[0] << 24) | ((uint32_t)blob[1] << 16) |
+                 ((uint32_t)blob[2] << 8) | blob[3];
+    size_t pos = 4;
+    for (uint32_t i = 0; i < n; i++) {
+        uint32_t b = bids[i];
+        const uint32_t *cum = cums + (size_t)b * 513;
+        uint32_t slot = x & (T - 1);
+        uint32_t s = lut[(size_t)b * T + slot];
+        out[i] = (uint16_t)s;
+        uint32_t f = cum[s + 1] - cum[s];
+        x = f * (x >> SCALE) + slot - cum[s];
+        while (x < RANS_L)
+            x = (x << 8) | (pos < blob_n ? blob[pos] : 0), pos++;
+    }
+    *consumed = (uint32_t)pos;
+    return 0;
+}
+
+static int64_t oxn8_round_shift(int64_t v, unsigned bits) {
+    int64_t scale = (int64_t)1 << bits;
+    int64_t floor = v / scale;
+    int64_t rem = v % scale;
+    if (rem < 0) { floor--; rem += scale; }
+    int64_t half = scale >> 1;
+    return floor + (rem > half || (rem == half && (floor & 1)));
+}
+
+int oxn8_requant(const double *in, size_t n, int64_t *out) {
+    int bad = 0;
+    #pragma omp parallel for if(n >= 32768) reduction(|:bad)
+    for (size_t i = 0; i < n; i++) {
+        if (!isfinite(in[i])) { bad = 1; continue; }
+        int64_t v = oxn8_round_shift((int64_t)in[i], 12);
+        out[i] = v < -1048576 ? -1048576 : v > 1048576 ? 1048576 : v;
+    }
+    return bad;
+}
+
+void oxn8_gelu(int64_t *x, size_t n, const int64_t *lut, size_t lut_n) {
+    #pragma omp parallel for if(n >= 32768)
+    for (size_t i = 0; i < n; i++) {
+        int64_t v = x[i];
+        if (v <= -32768) { x[i] = 0; continue; }
+        if (v >= 32768) continue;
+        int64_t pos = v + 32768;
+        int64_t idx = pos >> 4;
+        if (idx < 0) idx = 0;
+        if ((size_t)idx > lut_n - 2) idx = (int64_t)lut_n - 2;
+        int64_t frac = pos & 15;
+        int64_t y = lut[idx] + oxn8_round_shift((lut[idx + 1] - lut[idx]) * frac, 4);
+        x[i] = y;
+    }
+}
 
 static int prans(int argc, char **argv) {
     if (argc < 2) return -1;

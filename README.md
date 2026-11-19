@@ -98,14 +98,16 @@ python3 ox_neuro.py train --steps 40000 --batch 8 --data data/train \
 ## Optional: fast entropy stage (recommended)
 
 `ox` is a small C accelerator for the parametric rANS used by the codec.
-A prebuilt Linux binary is included; to rebuild:
+Rebuild the native executable and `libox.so` for the current architecture:
 
 ```bash
 make            # needs gcc; `make gpu` additionally uses nvcc if present
 ```
 
-If the binary is missing or fails, the codec transparently falls back to a
-pure-Python rANS (everything still works, just slower).
+The UI and viewer reuse the loaded models between files. If the native library
+and binary are missing or fail, the codec transparently falls back to subprocess
+or pure-Python rANS (everything still works, just slower). A binary built for
+another CPU architecture also takes the fallback path; rebuild it with `make`.
 
 ## Run the compressor UI
 
@@ -180,7 +182,7 @@ To retrain the context branch, run `python3 ox_neuro.py trainctx --steps 40000
 | `ox_neuro.py` | codec core: adaptive/flat OXN8 compression, OXN1–OXN8 decompression |
 | `oxn8_canon.npz` | immutable integer OXN8 GELU/bucket/rANS tables |
 | `ox.py` | static rANS entropy engine (reference) |
-| `ox.c` / `ox_cuda.cu` / `Makefile` / `ox` | C/CUDA accelerator (`prans`) |
+| `ox.c` / `ox_cuda.cu` / `Makefile` / `ox` / `libox.so` | native C/CUDA accelerator |
 | `ox_ui.py` | compressor web UI |
 | `oxh_viewer.py` | .oxh viewer |
 | `ox_neuro.pt` | codec checkpoint |
