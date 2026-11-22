@@ -225,6 +225,23 @@ encoder/decoder или веса, поэтому локальный roundtrip о�
 0.05531 меньший MS-SSIM и на 0.23357 больший LPIPS. Apple PICO сейчас лучше по скорости и
 по perceptual RD. Локальные результаты не следует представлять как победу над Apple.
 
+### 5.4. Triton analysis backend после исходного сравнения
+
+В отдельной ветке `oxp9-speed` принят специализированный direct grouped 3×3+GELU kernel для
+analysis. Он использует FP16 inputs/weights, FP32 accumulation/GELU и NHWC implicit GEMM на
+Triton/tensor cores. Synthesis, scale/context/predictor и decoder не изменены. Fallback:
+`OXP9_TRITON=0` или исходный PyTorch path при ошибке.
+
+| Сценарий | Baseline encode/decode | Triton encode/decode | bpp |
+|---|---:|---:|---:|
+| 4000×3000, q20, 5–7 runs | 1.420 / 0.977 s | **1.082 / 0.925 s** | 0.134012 → 0.134005 |
+| 201 Мп, q10, auto tiling | 22.374 / 15.759 s, tile 960 | 16.372 / 14.992 s, tile 1280 | разные auto-tile operating points |
+
+201-Мп строка проверяет память/стабильность, но не является controlled same-tile speed или
+matched-bpp сравнением. 12-Мп Apple-scene average после backend: 0.319315 bpp, 26.92439 dB,
+MS-SSIM 0.914458, LPIPS 0.274703. Все experts и старые streams прошли. Cold first small-image
+encode 1.498 s, cached repeat 0.0297 s. Подробности: `speed_experiments/`.
+
 ## 6. Узкие места по убыванию важности
 
 ### 6.1. Analysis encoder: grouped FP32/TF32 ConvScale — главная проблема

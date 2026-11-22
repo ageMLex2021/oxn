@@ -1,0 +1,46 @@
+{
+  "image": "/tmp/oxn_pico_12mp.png",
+  "variant": "e12e22",
+  "block": 32,
+  "selected_modules": [
+    "e12.0",
+    "e22.0",
+    "e22.1",
+    "e22.2"
+  ],
+  "q": 20,
+  "stream_version": 9,
+  "cold_first_encode_s": 1.36398246200406,
+  "encode_s": [
+    1.2760650599957444,
+    1.259474832986598,
+    1.2921904670074582,
+    1.291006899002241,
+    1.2717849190084962
+  ],
+  "decode_s": [
+    0.9769073150091572,
+    0.9773869189957622,
+    0.9378926149947802,
+    0.9704115589993307,
+    0.9761195970058907
+  ],
+  "encode_median_s": 1.2760650599957444,
+  "decode_median_s": 0.9761195970058907,
+  "bytes": 201095,
+  "bpp": 0.13406333333333334,
+  "baseline_bytes": 201018,
+  "baseline_bpp": 0.134012,
+  "bitstream_identical": false,
+  "stable_bitstream": true,
+  "blob_sha256": "957eb3c4500d80268b8194af72a35d7af1c3b8726c843d4d0a1cc8d181477a56",
+  "baseline_blob_sha256": "4df878650799b9e4d565e669c7d8140e83e386cecbaff8deab942e4ca040aa6d",
+  "psnr": 17.695732251132522,
+  "baseline_psnr": 17.69495772868987,
+  "max_abs_rgb": 65,
+  "mean_abs_rgb": 0.23788722222222222,
+  "changed_pixel_fraction": 0.18076083333333334,
+  "rec_sha256": "87b9cda0fa7120617ca8232ff5a90b0450bf20f1718678e64ffccf3e51f71cc8",
+  "baseline_rec_sha256": "c6e1f1afc82cdb13e2cfd39e345fe9c7e06cf8a15cf384e6ec3776485aa698f8",
+  "peak_cuda_reserved_bytes": 10787749888
+}

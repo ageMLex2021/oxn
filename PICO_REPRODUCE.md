@@ -1,6 +1,6 @@
 # Reproducing the OXP9 PICO MoE Experiment
 
-Branch: [`oxn9-tiny`](https://github.com/ageMLex2021/oxn/tree/oxn9-tiny)
+Branch: [`oxp9-speed`](https://github.com/ageMLex2021/oxn/tree/oxp9-speed)
 
 This package contains the current independent PICO implementation and the final six-expert
 OXP9 checkpoint. It does not include historical PICO checkpoints or new heavy weights for
@@ -10,6 +10,7 @@ and further training initialization.
 ## Included Files
 
 - `oxn_pico.py` — model architecture, training, OXP1–OXP9 codec, tiling, and runtime.
+- `oxn_pico_triton.py` — optional FP16-input/FP32-accumulation analysis backend with fallback.
 - `oxn_pico_v8_moe6_final.pt` — final 6-expert OXP9 model, 48,282,977 bytes.
 - `ox_neuro.py`, `ox.py`, `ox.c`, `ox_cuda.cu` — shared metrics, canonical entropy utilities,
   and native rANS implementation.
@@ -30,7 +31,7 @@ source code.
 ## Setup
 
 ```bash
-git clone --branch oxn9-tiny https://github.com/ageMLex2021/oxn.git
+git clone --branch oxp9-speed https://github.com/ageMLex2021/oxn.git
 cd oxn
 python3 -m pip install -r requirements.txt
 make
@@ -44,7 +45,10 @@ python3 -m pip install lpips
 ```
 
 PyTorch must be installed with CUDA support to use the ARM/CUDA fast path. CPU FP64 remains
-available for compatible non-fast streams and encoding with `--no-fast`.
+available for compatible non-fast streams and encoding with `--no-fast`. On ARM/CUDA, the
+Triton analysis backend is enabled when available; set `OXP9_TRITON=0` to use the original
+PyTorch convolution path. Reproducible experiment reports and commands are in
+`speed_experiments/`.
 
 ## Compress and Decompress
 
@@ -120,8 +124,8 @@ Development hardware: ARM64, 20 CPU cores, NVIDIA GB10 with 48 SMs, CUDA 13.0, P
 
 | Input | Encode | Decode | bpp |
 |---|---:|---:|---:|
-| 4000×3000, q20 | 1.366 s | 0.946 s | 0.134012 |
-| 12288×16384, q10 | 22.313 s | 14.169 s | 0.0879519 |
+| 4000×3000, q20 | 1.082 s | 0.925 s | 0.134005 |
+| 12288×16384, q10, auto tile 1280 | 16.372 s | 14.992 s | 0.0957699 |
 
 Apple reports 0.230 s encode and 0.150 s decode for 12 MP on iPhone 17 Pro Max. This is not a
 same-hardware comparison. OXP9 does not currently match Apple speed or perceptual RD.

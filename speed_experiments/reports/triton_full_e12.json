@@ -1,0 +1,43 @@
+{
+  "image": "/tmp/oxn_pico_12mp.png",
+  "variant": "e12",
+  "block": 32,
+  "selected_modules": [
+    "e12.0"
+  ],
+  "q": 20,
+  "stream_version": 9,
+  "cold_first_encode_s": 1.444279325005482,
+  "encode_s": [
+    1.3892641010024818,
+    1.3491152710048482,
+    1.373223226997652,
+    1.376173305005068,
+    1.3632336349983234
+  ],
+  "decode_s": [
+    0.9835125979880104,
+    0.9634908560110489,
+    0.9242337549949298,
+    0.9684626550006215,
+    0.958034609007882
+  ],
+  "encode_median_s": 1.373223226997652,
+  "decode_median_s": 0.9634908560110489,
+  "bytes": 201035,
+  "bpp": 0.13402333333333333,
+  "baseline_bytes": 201018,
+  "baseline_bpp": 0.134012,
+  "bitstream_identical": false,
+  "stable_bitstream": true,
+  "blob_sha256": "8e48e589c5bb021397270afc1c860511aa929d2d1fd3d2e8a6ae9c4d206433ff",
+  "baseline_blob_sha256": "4df878650799b9e4d565e669c7d8140e83e386cecbaff8deab942e4ca040aa6d",
+  "psnr": 17.695421044868763,
+  "baseline_psnr": 17.69495772868987,
+  "max_abs_rgb": 75,
+  "mean_abs_rgb": 0.18229533333333334,
+  "changed_pixel_fraction": 0.14698141666666667,
+  "rec_sha256": "7f6c30d8bd4489c81f7ac086a2bf9010207f76fca247e4eee6a05d4789e78fc0",
+  "baseline_rec_sha256": "c6e1f1afc82cdb13e2cfd39e345fe9c7e06cf8a15cf384e6ec3776485aa698f8",
+  "peak_cuda_reserved_bytes": 10787749888
+}

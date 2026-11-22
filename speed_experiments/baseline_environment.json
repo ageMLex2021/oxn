@@ -1,0 +1,22 @@
+{
+  "git_commit": "ae604e75faff17c9a02a35586b7b16d0947c1785",
+  "experiment_branch": "oxp9-speed",
+  "platform": "Linux aarch64 / NVIDIA DGX Spark",
+  "gpu": "NVIDIA GB10",
+  "compute_capability": "12.1",
+  "sm_count": 48,
+  "cpu": "20 cores: 10 Cortex-X925 + 10 Cortex-A725",
+  "driver": "580.178.04",
+  "cuda": "13.0",
+  "cudnn": "9.24.0",
+  "pytorch": "2.14.1+cu130",
+  "triton": "3.8.0",
+  "tensorrt": null,
+  "onnx": null,
+  "onnxruntime": null,
+  "gpu_sm_clock_mhz_observed": 2093,
+  "gpu_sm_clock_max_mhz": 3003,
+  "gpu_temperature_c_observed": 63,
+  "native_build": "make / nvcc -O3 -arch=native; libox.so",
+  "fast_path": "ARM/CUDA default; TF32 channels-last analysis; contiguous synthesis; GPU FP32 scale; pinned transfers; parallel entropy encode"
+}

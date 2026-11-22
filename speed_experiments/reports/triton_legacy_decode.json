@@ -1,0 +1,162 @@
+[
+  {
+    "scene": "alexander-shustov-73",
+    "prefix": "pico_v8_moe6_final",
+    "shape": [
+      1361,
+      2048,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "alexander-shustov-73",
+    "prefix": "pico_v7_moe_final",
+    "shape": [
+      1361,
+      2048,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "alexander-shustov-73",
+    "prefix": "pico_v5_sparse_frozen_7k",
+    "shape": [
+      1361,
+      2048,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "alexander-shustov-73",
+    "prefix": "pico_v4_soup50",
+    "shape": [
+      1361,
+      2048,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "b1400e99ef413c8fee7d5c0be41d7d1e",
+    "prefix": "pico_v8_moe6_final",
+    "shape": [
+      2048,
+      1365,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "b1400e99ef413c8fee7d5c0be41d7d1e",
+    "prefix": "pico_v7_moe_final",
+    "shape": [
+      2048,
+      1365,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "b1400e99ef413c8fee7d5c0be41d7d1e",
+    "prefix": "pico_v5_sparse_frozen_7k",
+    "shape": [
+      2048,
+      1365,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "b1400e99ef413c8fee7d5c0be41d7d1e",
+    "prefix": "pico_v4_soup50",
+    "shape": [
+      2048,
+      1365,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "kodim23",
+    "prefix": "pico_v8_moe6_final",
+    "shape": [
+      512,
+      768,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "kodim23",
+    "prefix": "pico_v7_moe_final",
+    "shape": [
+      512,
+      768,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "kodim23",
+    "prefix": "pico_v5_sparse_frozen_7k",
+    "shape": [
+      512,
+      768,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "kodim23",
+    "prefix": "pico_v4_soup50",
+    "shape": [
+      512,
+      768,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "philipp-reiner-207",
+    "prefix": "pico_v8_moe6_final",
+    "shape": [
+      900,
+      1440,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "philipp-reiner-207",
+    "prefix": "pico_v7_moe_final",
+    "shape": [
+      900,
+      1440,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "philipp-reiner-207",
+    "prefix": "pico_v5_sparse_frozen_7k",
+    "shape": [
+      900,
+      1440,
+      3
+    ],
+    "maxdiff_saved": 1
+  },
+  {
+    "scene": "philipp-reiner-207",
+    "prefix": "pico_v4_soup50",
+    "shape": [
+      900,
+      1440,
+      3
+    ],
+    "maxdiff_saved": 1
+  }
+]

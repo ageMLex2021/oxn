@@ -233,6 +233,24 @@ Average gap: OXP9 uses 10.11% more bits, has 2.624 dB lower PSNR, 0.05531 lower 
 and 0.23357 higher LPIPS. Apple PICO currently leads in both speed and perceptual RD. These
 local results must not be presented as a victory over Apple.
 
+### 5.4. Triton Analysis Backend After the Original Comparison
+
+The separate `oxp9-speed` branch adds a specialized direct grouped 3×3+GELU analysis kernel.
+It uses FP16 inputs/weights, FP32 accumulation/GELU, and NHWC implicit GEMM on Triton/tensor
+cores. Synthesis, scale/context/predictor, and the decoder are unchanged. Use
+`OXP9_TRITON=0` or the original PyTorch error fallback to disable/bypass it.
+
+| Scenario | Baseline encode/decode | Triton encode/decode | bpp |
+|---|---:|---:|---:|
+| 4000×3000, q20, 5–7 runs | 1.420 / 0.977 s | **1.082 / 0.925 s** | 0.134012 → 0.134005 |
+| 201 MP, q10, auto tiling | 22.374 / 15.759 s, tile 960 | 16.372 / 14.992 s, tile 1280 | different auto-tile operating points |
+
+The 201-MP row validates memory/stability but is not a controlled same-tile speed or
+matched-bpp comparison. The Apple-scene average after the backend is 0.319315 bpp, 26.92439
+dB PSNR, 0.914458 MS-SSIM, and 0.274703 LPIPS. All experts and existing streams passed.
+Cold first small-image encode was 1.498 s, followed by a cached 0.0297 s repeat. Details and
+reports are in `speed_experiments/`.
+
 ## 6. Bottlenecks in Decreasing Order of Importance
 
 ### 6.1. Analysis Encoder: Grouped FP32/TF32 ConvScale — the Main Problem

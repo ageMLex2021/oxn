@@ -97,6 +97,20 @@ only at the last shown decimal places. All six experts, old OXP6/OXP7/OXP8/OXP9 
 the FP64 path passed roundtrips. Results: `data/eval/pico_v8_moe6_speed_12mp.json`,
 `data/eval/pico_v8_moe6_speed_201mp.json`, and `data/eval/pico/v8_moe6_speed_apple.json`.
 
+#### Triton direct grouped analysis (OXP9)
+
+`oxn_pico_triton.py` adds an ARM/CUDA backend for grouped analysis Conv3×3+GELU using FP16
+inputs/weights, FP32 accumulation/GELU and NHWC implicit GEMM. Synthesis and entropy decoding
+are unchanged; `OXP9_TRITON=0` restores the original path. Fresh same-checkout 12-MP baseline
+versus candidate (five/seven runs after two warmups): encode **1.4203 → 1.0819 s**, decode
+**0.9767 → 0.9249 s**, size **201018 → 201008 bytes** (0.134012 → 0.134005 bpp). Candidate
+PSNR/MS-SSIM/LPIPS: 17.69330 / 0.696788 / 0.436955. Apple-scene average: 0.319315 bpp,
+26.92439 dB, 0.914458 MS-SSIM, 0.274703 LPIPS. All six experts and 16 old OXP6–OXP9 fixtures
+passed. Cold small-image first encode was 1.498 s versus a cached 0.0297 s repeat.
+The 201-MP auto-tiling regression also passed five runs (16.372 s encode, 14.992 s decode,
+PSNR 20.459), but baseline/candidate selected different tile sizes, so that row is not a
+controlled same-tile speed comparison. Full reports: `speed_experiments/`.
+
 PICO v5 sparse also improves the three screenshot holdouts simultaneously: 0.2019 bpp,
 26.825 dB, MS-SSIM 0.9363 and LPIPS 0.2974, versus 0.2372 bpp, 25.902 dB,
 0.9141 and 0.3735 for PICO v4. Its 201-MP OXP7 roundtrip used 0.1651 bpp and

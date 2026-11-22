@@ -153,3 +153,11 @@ entropy tasks, pinned transfers и GPU uint8 output. Подробности и �
 3.33ГиБ RSS. Apple streams побайтово совпали. Старые OXP6–OXP9 и все 6 experts читаются.
 Apple speed всё ещё не достигнут; следующий кандидат — AOT/native integer/tensor-core
 pipeline, а не изменение MoE или дополнительная параллелизация маленького rANS decode.
+
+## Triton speed backend
+
+Ветка `oxp9-speed` содержит принятый `oxn_pico_triton.py`: direct grouped NHWC Conv3×3+GELU,
+FP16 inputs/weights с FP32 accumulation, только analysis. 12-Мп encode 1.0819с, decode 0.9249с;
+RD и совместимость прошли. Fallback `OXP9_TRITON=0`. Веса не изменены. Полные отчёты и rejected
+POC находятся в `speed_experiments/`. Чистая PICO-only публикация делается отдельной веткой
+`pico`, без других моделей/UI.

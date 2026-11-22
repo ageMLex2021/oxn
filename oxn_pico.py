@@ -484,11 +484,14 @@ _RUNTIME_CACHE = {}
 
 
 def _runtime(ckpt, fast=False):
-    key = (os.path.abspath(ckpt), fast)
+    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+    use_triton = (fast and dev == 'cuda' and
+                  platform.machine().lower() in ('aarch64', 'arm64') and
+                  os.environ.get('OXP9_TRITON', '1') != '0')
+    key = (os.path.abspath(ckpt), fast, use_triton)
     if key in _RUNTIME_CACHE:
         return _RUNTIME_CACHE[key]
     model, _ = _load(ckpt)
-    dev = 'cuda' if torch.cuda.is_available() else 'cpu'
     if fast and dev != 'cuda':
         raise RuntimeError('OXP5 requires CUDA')
     model.to(dev)
@@ -501,6 +504,12 @@ def _runtime(ckpt, fast=False):
         else:
             for name in _SYNTHESIS_NAMES:
                 getattr(model, name).to(memory_format=torch.contiguous_format)
+        if use_triton:
+            try:
+                from oxn_pico_triton import patch_analysis
+                patch_analysis(model)
+            except ImportError:
+                pass
         canon = model.scale_decoder
         hyper_logsig = model.hyper_logsig
     else:
@@ -766,7 +775,7 @@ def _decompress_tile_impl(blob, model, canon, hyper_logsig, dev, fast, sparse=Fa
     hyper_sig = sigh.float().cpu().numpy() if fast else sigh.numpy()
     hq = _sparse_stream_decode(streams[0], hyper_sig, (192, hp // 64, wp // 64)) \
         if sparse else _stream_decode(streams[0], hyper_sig, (192, hp // 64, wp // 64), empirical)
-    hqd_cpu = torch.from_numpy(hq)[None].to(torch.float64) / 2
+    hqd_cpu = None if fast else torch.from_numpy(hq)[None].to(torch.float64) / 2
     hqd = torch.from_numpy(hq)[None].to(dev) / 2
     if fast:
         hqd = hqd.contiguous(memory_format=torch.channels_last)

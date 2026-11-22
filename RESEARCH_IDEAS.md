@@ -543,3 +543,19 @@ fusion (нестабильный/нулевой выигрыш и численн
 быстрее whole, bpp 0.144–0.159 против 0.134). До Apple 0.23/0.15с всё ещё большой gap;
 следующий реальный скачок требует AOT/native integer или tensor-core convolution pipeline,
 а не дальнейшей оптимизации четырёх predictor/rANS этапов.
+
+### Direct Triton tensor-core analysis — принято
+
+Новый direct implicit-GEMM grouped Conv3×3+GELU использует NHWC, девять `tl.dot`, FP16
+inputs/weights и FP32 accumulation/GELU. Он не разворачивает группы в dense zeros и не меняет
+decoder. Все совместимые grouped analysis layers патчатся только в fast runtime; исходный
+ConvScale сохранён как fallback, `OXP9_TRITON=0` отключает backend.
+
+12-Мп fresh baseline 1.4203/0.9767с → 1.0819/0.9249с; 201018 → 201008 байт. Apple average
+немного улучшился до 0.319315bpp, 26.92439dB, MS-SSIM 0.914458, LPIPS 0.274703. Все 6 experts,
+legacy OXP6–OXP9 и 201-Мп пять roundtrips прошли. Cold first small encode 1.498с, cached
+0.0297с. Отчёты `speed_experiments/`.
+
+Winograd F(2×2) на e12 отклонён: 0.132823с против 0.132213с baseline. Полный CS311 Triton
+fusion и synthesis direct trial также не дали преимущества над выбранным путём. TensorRT/ONNX
+в окружении отсутствуют, драйвер/CUDA не менялись. До Apple speed всё ещё есть большой gap.
