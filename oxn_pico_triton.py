@@ -80,15 +80,15 @@ class FusedConvGelu(nn.Module):
 
 
 def patch_analysis(model, block=64):
-    from oxn_pico import CS311
-
     selected = []
     for name, module in model.named_modules():
         if not name.startswith(('e11.', 'e12.', 'e21.', 'e22.', 'e31.', 'e32.')):
             continue
-        if not isinstance(module, CS311):
+        if not hasattr(module, 'net') or not isinstance(module.net, nn.Sequential):
             continue
         conv = module.net[0]
+        if not isinstance(conv, nn.Conv2d):
+            continue
         if conv.groups == 1 or conv.in_channels // conv.groups != 32:
             continue
         module.net[0] = FusedConvGelu(conv, block)
