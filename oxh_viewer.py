@@ -18,6 +18,7 @@ import threading
 import webbrowser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, quote
+from ox_ui import _release_after
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 OX_NEURO = os.path.join(HERE, 'ox_neuro.py')
@@ -145,6 +146,7 @@ if (cur) load(cur);
 """
 
 
+@_release_after
 def decode_oxh(path):
     """Decode .oxh to JPEG bytes (cached by mtime/size)."""
     st = os.stat(path)
@@ -154,13 +156,33 @@ def decode_oxh(path):
     with open(path, 'rb') as f:
         blob = f.read()
     import ox_neuro
+    import ox_ui
     with _codec_lock:
+        pico = blob[:4] in (b'OXP1', b'OXP2', b'OXP3', b'OXP4', b'OXP5', b'OXP6', b'OXP7', b'OXP8', b'OXP9')
+        model = ('picomoe' if blob[:4] in (b'OXP8', b'OXP9') else 'pico5' if blob[:4] == b'OXP7' else
+                 'pico2' if blob[:4] == b'OXP6' else 'pico' if pico else
+                 'tiny2' if blob[:4] == b'OXNV' else
+                 'tiny' if blob[:4] in (b'OXN9', b'OXNT') else
+                 'oxn17' if blob[:4] in (b'OXNH', b'OXNI') else 'oxn8')
+        ox_ui._activate_model(model, stream=True)
         try:
-            rec = ox_neuro.neuro_decompress(blob)
+            if pico:
+                import oxn_pico
+                ckpt = ox_ui.PICO_MOE_CKPT if model == 'picomoe' else \
+                    ox_ui.PICO5_CKPT if model == 'pico5' else \
+                    ox_ui.PICO2_CKPT if model == 'pico2' else ox_ui.PICO_CKPT
+                rec = oxn_pico.decompress(blob, ckpt)
+            else:
+                if model == 'tiny2':
+                    rec = ox_neuro.neuro_decompress(blob, ox_ui.TINY2_CKPT, ox_ui.TINY2_CTX7)
+                else:
+                    rec = ox_neuro.neuro_decompress(blob)
         except Exception as e:
-            if 'CUDA' not in str(e) or 'memory' not in str(e):
+            if pico or 'CUDA' not in str(e) or 'memory' not in str(e):
                 raise
             ox_neuro._FORCE_CPU = True
+            ox_ui._RESIDENT = False
+            ox_ui._unload_models_locked()
             import torch
             torch.cuda.empty_cache()
             rec = ox_neuro.neuro_decompress(blob)
@@ -186,7 +208,9 @@ def list_oxh(folder):
         try:
             with open(p, 'rb') as fh:
                 if fh.read(4) in (b'OXN1', b'OXN2', b'OXN3', b'OXN4',
-                                  b'OXN5', b'OXN6', b'OXN7', b'OXN8', b'OXN9'):
+                                  b'OXN5', b'OXN6', b'OXN7', b'OXN8', b'OXN9', b'OXNT', b'OXNV',
+                                  b'OXNA', b'OXNB', b'OXNC', b'OXND', b'OXNE',
+                                  b'OXNG', b'OXNH', b'OXNI', b'OXP1', b'OXP2', b'OXP3', b'OXP4', b'OXP5', b'OXP6', b'OXP7', b'OXP8', b'OXP9'):
                     out.append(p)
         except OSError:
             pass

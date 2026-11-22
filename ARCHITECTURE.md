@@ -132,7 +132,8 @@ like the hyperprior canon.
 
 ## OXN8 — deterministic integer entropy canon
 
-OXN8 is the only format produced by new compression. Its mode byte selects an
+OXN8 is the stable base format; newer experimental formats are selected explicitly.
+Its mode byte selects an
 adaptive per-patch scale map (default) or one flat scale (`--flat`). Both modes
 reuse the trained `ox_ctx7.pt` channel-group network; no context retraining was
 required for integer conversion.
@@ -170,10 +171,171 @@ with PSNR changes within ±0.003 dB.
 
 The `oxn9-tiny` branch keeps OXN8 intact and adds an auto-detected OXN9 stream.
 Its architecture uses dim=48, one encoder/decoder block, latent=8, hyper width
-and channels=8, and an 8-wide context network: 154,592 parameters in total versus
-17,123,051 for OXN8 (110.8× fewer). It is trained from scratch on available local
-photographs because the original `data/` corpus is absent. This is a speed and
-feasibility experiment, not a comparable Kodak RD benchmark. At 2880×2160 q50,
-adaptive encode measured 0.62 s versus 5.06 s for OXN8 (8.2×), decode 0.35 s
-versus 1.35 s (3.9×); PSNR dropped from 21.70 to 18.00 dB and the file shrank
-from 167,312 to 68,576 bytes. See `BENCHMARKS.md` for the flat mode and caveats.
+and channels=8, an 8-wide context network and a convolutional refinement head:
+195,043 parameters in total versus 17,123,051 for OXN8 (87.8× fewer). After the
+initial 4,000-step run it was fine-tuned for 40,000 steps on Kodak01–20 plus
+available local photographs, jointly with the context model and MS-SSIM/Sobel
+losses. Kodak21–24 remained an honest holdout. At q50 the retrained model improves
+mean PSNR from 21.46 to 22.65 dB and MS-SSIM from 0.731 to 0.849; at q75 PSNR
+improves from 21.63 to 22.73 dB while mean bitrate falls slightly. See
+`BENCHMARKS.md` for the rate-quality table. New tiny training candidates use the
+`OXNT` magic to keep their context versions distinct from legacy OXN9 streams.
+`ox_data.py` provides lazy multi-root crops with holdout exclusions; tiny and PICO
+share multi-resolution TAL, per-patch color, seam-continuity and gradient-saliency
+fidelity losses. `bench_research.py` records RD metrics, color shift, boundary
+error, runtime and memory for both experiment families.
+
+## OXN10 — one-shot entropy experiment
+
+OXN10 keeps the OXN8 autoencoder, latent representation and canonical integer
+hyperprior, but writes a separate `OXNA` stream. Gaussian bucket IDs are selected
+once from hyperprior `logb`; all residual streams are rANS-decoded before context
+reconstruction. The context network then predicts only residual-center offsets,
+in seven group/phase passes on the GPU (or FP32 CPU when CUDA is unavailable),
+instead of predicting both center and width through the integer CPU path. The
+reconstruction decoder and therefore PSNR are unchanged at a given scale map.
+This is a latency/bitrate experiment, not a replacement for OXN8's fully integer
+context canon. `trainctx --one_shot` trains the center offsets with fixed
+hyperprior widths; `--resume_step` resumes the original cosine schedule after an
+interrupted run. A 40,000-step candidate increased the actual bucketed bitrate,
+so the initial OXN7-initialized context is retained. See `BENCHMARKS.md` for the
+speed/bitrate tradeoff.
+
+## OXN11 — spatial one-shot sigma
+
+OXN11 (`OXNB`) preserves OXN10 compatibility while adding a three-layer scale
+network. It receives only hyperprior `mu`, `logb` and the stored scale map, then
+predicts spatially varying log-sigma in one pass before rANS decoding. Its Q20.12
+integer CPU inference avoids GPU/CPU bucket desynchronization; the seven context
+passes for residual centers still run on GPU. Per-channel-only calibration and
+longer/joint training were rejected after actual holdout bitrate measurements.
+The selected 4,000-step scale network reduces OXN10 overhead from 6–16% to 3–7%
+on Kodak21–24 and from 32% to 5% on the 12 MP q100 benchmark.
+
+## OXN12 — table-aware training and 2×2 grid
+
+A straight-through training loss evaluates the exact canonical rANS table cost
+using rounded residual centers and Q20.12 bucket selection, while retaining the
+continuous Gaussian gradient. This reduces OXN11 bitrate by another 0.4–0.6%.
+OXN12 (`OXNC`) then replaces channel-group checkerboard with four 2×2 spatial
+phases over one 24-channel group. Only three phases require context inference.
+The scale network remains frozen during grid training. Grid context trades a
+small low-q bitrate regression for high-q gains and slightly faster decoding;
+both OXN11 and OXN12 remain available.
+
+## OXN13 — grouped 2×2 context
+
+OXN13 (`OXND`) keeps the table-aware scale network and 2×2 phases but splits the
+latent into two 12-channel groups. This restores causal cross-channel information
+with seven context passes, matching OXN11's pass count. An encoder-side rate
+refinement then evaluates every scale candidate against actual canonical table
+costs at the current context centers and widths, and rebuilds the scale map once.
+It is enabled below q100; q100 keeps the original allocation. The result is
++1.9% bpp at q25, −0.9% at q50 and +1.2% at q75 over OXN8. Quantization-aware
+scale fine-tuning was tested but rejected after a small consistent regression.
+Further work should target the one-shot scale predictor rather than adding more
+sequential context passes.
+
+## OXN14 — empirical canonical rANS tables
+
+OXN14 (`OXNE`) keeps the OXN13 model and allocation but replaces the Gaussian
+frequency tables with empirical residual distributions measured on Kodak01–20 at
+five quality levels. Tables use a 100,000-count Gaussian prior, nonzero frequency
+for every symbol and exact RT=4096 normalization. New bucket IDs 96–119 select
+these tables; OXN8–13 retain the original canon. Native, subprocess and pure-Python
+rANS share the same tables. Rate refinement naturally uses the new table costs.
+On the honest Kodak21–24 holdout OXN14 is smaller than OXN8 from q25 through q75,
+with only +0.9% overhead at q92.
+
+## OXN15/16 — channel-group tables and best-of selection
+
+OXN15 (`OXNG`) adds 48 empirical Gaussian tables: one 24-bucket set per 12-channel
+group, using bucket IDs 120–167. Statistics come only from Kodak01–20. Since the
+standalone gain is mixed, OXN16 is not a new bitstream: it encodes OXN14 and OXN15
+and returns the smaller candidate. The existing magic header selects decoding.
+This guarantees no per-image size regression, at the cost of two encodes.
+OXN17 applies this best-of encoder to the Rec1 checkpoint and changes the magic to
+`OXNH` (shared tables) or `OXNI` (channel-group tables). These headers make the
+decoder select `ox_neuro_rec.pt` automatically; OXNE/OXNG continue to select the
+base checkpoint. OXN17 fast writes only `OXNH`, performs one encode and uses eight
+exact-RD scale-map refinement passes; sixteen passes showed no additional gain.
+
+## Recurrent joint decoder experiment
+
+`--recurrent N` adds a zero-initialized convolutional refinement block shared by
+N sequential reconstruction iterations. With `N=3` the initial checkpoint is an
+exact OXN14 identity. `--freeze_enc` now includes both refinement families in the
+trainable decoder set while freezing encoder and entropy parameters. Optional
+`--w_lpips` adds differentiable AlexNet LPIPS to MSE/MS-SSIM training. A recurrent
+checkpoint remains stream-compatible with OXN13–16; its decoder can also improve
+the encoder-side scale allocation. The perceptual candidate is stored separately
+and is not the default model. See `BENCHMARKS.md` for measured trade-offs.
+
+`--flow N` is a separate conditional rectified-flow experiment. A small time-
+conditioned convolutional velocity head starts from the learned reconstruction,
+runs N Euler steps with two fixed noise seeds and applies an exponential agreement
+gate to their residuals. `--w_flow` adds the flow-matching target during joint
+decoder training. The encoder and transmitted latent remain unchanged; no
+free-running semantic generation is used.
+
+## OXN-MR and OXN-W research prototypes
+
+`oxn_mr.py` contains jointly trained YCoCg `/16→/8→/4` models, a shared synthesis
+block, hyperprior and exact table-aware discrete rate loss. OXM1 uses all levels;
+OXM2 gates levels by scale; OXM3 additionally stores per-image float16 channel
+scales optimized by encoder-side gradient RD. None of MR1–MR4 beat OXN14 on the
+holdout, so they are not integrated into the UI or default pipeline.
+
+`oxn_wave.py` is a separate three-level YCoCg/Haar sparse-pyramid experiment with
+adaptive or canonical rANS per subband (`OXW1`). It also trails OXN14 and remains
+a standalone prototype.
+
+## PICO paper reimplementation
+
+`oxn_pico.py` reproduces the public CVPR 2026 architecture diagrams: ConvScale311
+backbones with learned input/output and activation scales, Haar resampling, four
+outer-analysis downsamplings and four synthesis upsamplings, a `/64` hyper-latent,
+separate scale and context decoders, and a four-phase 2×2 one-shot context with
+elementwise residual centers and quantization widths. Quality uses interpolated
+8-dimensional level conditioning and level-dependent latent gains.
+
+OXP1 used legacy Gaussian rANS tables. OXP2 switches to the empirical OXN14
+canon; scale inference remains CPU FP64 while context inference follows PICO and
+runs on the accelerator. Training uses exact empirical-table cost for the loss
+value and a smooth Gaussian straight-through gradient, avoiding both RT optimism
+and unstable discrete-table gradients. Perceptual training additionally supports
+LPIPS, multi-resolution tiling loss and a warm-started PatchGAN discriminator.
+OXP3 stores independently coded tiles to bound inference memory on large images.
+OXP4 adds a spatial halo (up to 64 pixels by default): the expanded tile is
+coded independently, then the halo is cropped during reconstruction to reduce
+seams. By default the encoder derives the core size from free RAM/VRAM, worker
+count, halo and a conservative per-pixel working-set estimate. The throughput cap
+is `2048 * sqrt((SM_count * clock) / (48 * 2.418 GHz))`, clamped to 1024–4096:
+the GB10 calibration is scaled to the current GPU. A frame is processed whole
+whenever it fits; a fixed multiple-of-64 size remains available for
+experiments. Tiled inference can overlap two CUDA streams, and reconstruction is
+assembled in stream order. OXP5 is a separate ARM/CUDA experiment: TF32
+channels-last analysis convolutions and GPU FP32 scale inference replace the CPU FP64
+canonical path. On ARM/CUDA this is now the default at every frame size; synthesis and
+RGB output use contiguous layout because that is measurably faster on GB10. The four
+spatial phases remain causally ordered, but use strided slices rather than CPU mask
+transfers. Hyper entropy overlaps GPU inference, independent spatial entropy streams use
+a five-thread CPU pool, and final RGB quantization transfers uint8 instead of float32.
+OXP5 streams are not claimed to be cross-device
+deterministic. OXP6 uses the tiled container with an explicit fast/FP64 flag and selects
+the full-corpus v4 checkpoint in UI/viewer, so legacy OXP1–OXP5 and v4 weights cannot be
+mixed accidentally. OXP7 adds sparse residual coding: a packed/zlib nonzero bitmap and
+plain rANS only for nonzero values, with per-stream plain/sparse selection. Its selective
+training freezes analysis, predictor and entropy while synthesis and level/channel masks
+adapt. OXP9 stores an explicit expert ID and selects one of six synthesis experts by
+target bitrate; analysis and entropy are shared. The ultra-low expert also uses a 2x2
+anchor spatial base layer, while higher-rate experts use the full latent grid.
+OXNV applies the same checkpoint separation to Tiny v4. Its
+checkpoint-specific scale predictor uses latent, quantization, rate and pixel features
+to estimate all seven distortion levels; only two levels require exact decoding.
+OXP1/OXP2
+remain readable. ConvScale input/output scales are folded into convolution weights once
+at runtime initialization. Training reads random crops on demand rather than
+retaining the complete dataset as float32 tensors; experiment arguments and
+corpus size are stored in new checkpoints. This is an independent implementation
+from the paper, not Apple weights or code.

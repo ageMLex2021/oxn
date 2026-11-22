@@ -12,6 +12,8 @@ skipped silently. GPU is used automatically; on VRAM exhaustion the codec
 falls back to CPU (inside ox_neuro.py).
 """
 
+import functools
+import gc
 import io
 import json
 import os
@@ -28,10 +30,24 @@ OX_NEURO = os.path.join(HERE, 'ox_neuro.py')
 CKPT = os.path.join(HERE, 'ox_neuro.pt')
 CTX7 = os.path.join(HERE, 'ox_ctx7.pt')
 CANON8 = os.path.join(HERE, 'oxn8_canon.npz')
+CANON14 = os.path.join(HERE, 'oxn14_canon.npz')
+CANON15 = os.path.join(HERE, 'oxn15_canon.npz')
+REC_CKPT = os.path.join(HERE, 'ox_neuro_rec.pt')
+PICO_CKPT = os.path.join(HERE, 'oxn_pico.pt')
+PICO2_CKPT = os.path.join(HERE, 'oxn_pico_v4_soup50.pt')
+PICO5_CKPT = os.path.join(HERE, 'oxn_pico_v5_sparse_frozen_7k.pt')
+PICO_MOE_CKPT = os.path.join(HERE, 'oxn_pico_v8_moe6_final.pt')
+OXN13_CTX = os.path.join(HERE, 'ox_ctx13.pt')
 TINY_CKPT = os.path.join(HERE, 'ox_neuro_tiny.pt')
 TINY_CTX7 = os.path.join(HERE, 'ox_ctx9_tiny.pt')
+TINY2_CKPT = os.path.join(HERE, 'ox_tiny_v4.pt')
+TINY2_CTX7 = os.path.join(HERE, 'ox_tiny_v4_ctx.pt')
+TINY2_BOOST = os.path.join(HERE, 'ox_tiny_v4_boost.pt')
 MAX_UPLOAD = 4 * 1024 * 1024 * 1024  # 4 ГБ
 _CODEC = None
+_ACTIVE_MODEL = None
+_RESIDENT = False
+_RESIDENT_STATES = {}
 _CODEC_LOCK = threading.Lock()
 
 IMG_EXT = ('.png', '.jpg', '.jpeg', '.webp', '.bmp', '.gif', '.tif', '.tiff')
@@ -117,11 +133,21 @@ PAGE = r"""<!DOCTYPE html>
       <label style="color:var(--dim)">model
         <select id="md">
           <option value="oxn8">OXN8 (stable)</option>
-          <option value="tiny">OXN9 tiny · 111× fewer params</option>
+          <option value="oxn17fast">OXN17 fast · single encode</option>
+          <option value="oxn17">OXN17 best-of · smallest file, 2× slower</option>
+          <option value="pico">PICO reimplementation · research</option>
+          <option value="picoauto">PICO auto · low/high best profile</option>
+          <option value="pico2">PICO v4 perceptual · OXP6</option>
+          <option value="pico5">PICO v5 sparse low-rate · OXP7</option>
+          <option value="picomoe">PICO MoE 6 rate experts · OXP9</option>
+          <option value="tiny">OXNT tiny · 88× fewer params</option>
+          <option value="tiny2">Tiny v4 perceptual · OXNV + scale boost</option>
         </select>
       </label>
       <span style="color:var(--dim)">quality</span>
       <input type="number" id="q" value="100" min="1" max="100">
+      <label style="color:var(--dim)" title="Только tiny/PICO: 0 = обычный quality, >0 = подобрать q под целевой битрейт (несколько проходов)">target bpp</label>
+      <input type="number" id="tb" value="0" min="0" max="24" step="0.01" style="width:90px">
       <label style="color:var(--dim)" title="Включено: адаптивная степень по патчам. Выключено: плоская степень. Оба режима используют детерминированный OXN8.">
         <input type="checkbox" id="ad" checked> adaptive OXN8 (off = flat OXN8)
       </label>
@@ -145,8 +171,15 @@ PAGE = r"""<!DOCTYPE html>
 const $ = id => document.getElementById(id);
 let files = [];       // File[]
 let saveDir = null;   // FileSystemDirectoryHandle или null (обычное скачивание)
+let activeModel = 'oxn8';
+let modelBusy = false;
 
 fetch('/api/info').then(r => r.json()).then(i => {
+  if (i.model) {
+    activeModel = i.model;
+    $('md').value = i.model;
+    updateMode();
+  }
   const b = $('hw');
   if (i.cuda) { b.textContent = 'GPU: ' + i.gpu; b.className = 'badge gpu'; }
   else { b.textContent = 'CPU'; }
@@ -185,11 +218,39 @@ drop.ondrop = async e => {
 };
 $('file').onchange = e => { addFiles([...e.target.files]); e.target.value = ''; };
 function updateMode() {
-  $('bs').disabled = !$('ad').checked || $('md').value === 'tiny';
-  $('bs').title = $('md').value === 'tiny' ? 'OXN9 tiny не использует OXN8 boost' : '';
+  const model = $('md').value;
+  $('tb').disabled = !model.startsWith('pico') && !model.startsWith('tiny');
+  $('q').disabled = !$('tb').disabled && Number($('tb').value) > 0;
+  $('ad').disabled = model.startsWith('pico');
+  $('bs').disabled = !$('ad').checked || model !== 'oxn8';
+  $('bs').title = model.startsWith('tiny') ? 'Tiny использует собственный scale predictor' :
+    model.startsWith('oxn17') ? 'OXN17 использует собственный encoder без OXN8 boost' : '';
 }
 $('ad').onchange = updateMode;
-$('md').onchange = updateMode;
+$('tb').oninput = updateMode;
+$('md').onchange = async () => {
+  const previous = activeModel;
+  const requested = $('md').value;
+  modelBusy = true;
+  busy(true);
+  updateMode();
+  try {
+    const r = await fetch('/api/model', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify({model: requested})
+    });
+    if (!r.ok) throw new Error(await r.text());
+    activeModel = requested;
+    log('model loaded: ' + requested);
+  } catch (e) {
+    $('md').value = previous;
+    log('model load failed: ' + e);
+    updateMode();
+  } finally {
+    modelBusy = false;
+    busy(false);
+  }
+};
 updateMode();
 
 function addFiles(fs) {
@@ -229,8 +290,9 @@ function log(msg) {
 }
 function busy(on) {
   $('prog').classList.toggle('hidden', !on);
-  $('bc').disabled = $('bd').disabled = on || !files.length;
-  $('sd').disabled = on;
+  $('bc').disabled = $('bd').disabled = on || modelBusy || !files.length;
+  $('sd').disabled = on || modelBusy;
+  $('md').disabled = on || modelBusy;
 }
 
 // ---------- куда сохранять ----------
@@ -278,6 +340,7 @@ async function run(op) {
       const fd = new FormData();
       fd.append('file', f);
       fd.append('q', $('q').value);
+      fd.append('target_bpp', $('tb').value);
       fd.append('model', $('md').value);
       fd.append('adaptive', $('ad').checked ? '1' : '0');
       fd.append('boost', $('bs').checked ? '1' : '0');
@@ -346,41 +409,274 @@ def _codec():
     return _CODEC
 
 
-def _codec_call(ox, fn, *args):
+def _model_key(model):
+    if model in ('oxn8', 'tiny', 'tiny2', 'pico', 'pico2', 'pico5', 'picomoe'):
+        return model
+    if model in ('oxn17', 'oxn17fast'):
+        return 'oxn17'
+    raise ValueError(f'unknown model: {model}')
+
+
+_MODEL_FILES = {
+    'oxn8': (CKPT, CTX7),
+    'oxn17': (REC_CKPT, OXN13_CTX),
+    'tiny': (TINY_CKPT, TINY_CTX7),
+    'tiny2': (TINY2_CKPT, TINY2_CTX7, TINY2_BOOST),
+    'pico': (PICO_CKPT,),
+    'pico2': (PICO2_CKPT,),
+    'pico5': (PICO5_CKPT,),
+    'picomoe': (PICO_MOE_CKPT,),
+}
+
+
+def _unload_models_locked():
+    global _ACTIVE_MODEL
+    _ACTIVE_MODEL = None
+    _RESIDENT_STATES.clear()
+    if _CODEC is not None:
+        ox = _CODEC
+        ox._MODEL_CACHE.clear()
+        ox._LEGACY_CPU_MODEL_CACHE = None
+        ox._BOOST = None
+        ox._CTX = None
+        ox._CTX7 = None
+        ox._CTX10 = None
+        ox._QCTX7 = None
+    pico = sys.modules.get('oxn_pico')
+    if pico is not None:
+        pico._RUNTIME_CACHE.clear()
+    gc.collect()
+    torch = sys.modules.get('torch')
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _clear_aux_models_locked():
+    if _CODEC is not None:
+        ox = _CODEC
+        ox._LEGACY_CPU_MODEL_CACHE = None
+        ox._CTX = None
+        ox._CTX7 = None
+        ox._CTX10 = None
+        ox._QCTX7 = None
+    gc.collect()
+    torch = sys.modules.get('torch')
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _load_model_locked(key):
+    if key in ('pico', 'pico2', 'pico5', 'picomoe'):
+        import torch
+        import oxn_pico
+        dev = 'cuda' if torch.cuda.is_available() else 'cpu'
+        fast = oxn_pico._default_fast(dev)
+        ckpt = PICO_MOE_CKPT if key == 'picomoe' else PICO5_CKPT if key == 'pico5' else \
+            PICO2_CKPT if key == 'pico2' else PICO_CKPT
+        oxn_pico._runtime(ckpt, fast)
+        return dev
+    ox = _codec()
+    if key in ('tiny', 'tiny2'):
+        ox.CTX7_FILE = TINY2_CTX7 if key == 'tiny2' else ox.TINY_CTX7
+        model, dev = ox._load(TINY2_CKPT if key == 'tiny2' else TINY_CKPT)
+        ox._qctx7_net(model.latent)
+        if key == 'tiny2':
+            if ox.BOOST_FILE != TINY2_BOOST:
+                ox.BOOST_FILE = TINY2_BOOST
+                ox._BOOST = None
+            ox._boost_net(dev)
+    else:
+        ox.CTX7_FILE = ox.OXN8_CTX7
+        if key == 'oxn17':
+            model, dev = ox._load(REC_CKPT)
+            ox._ctx10_net(model.latent, dev, OXN13_CTX)
+        else:
+            model, dev = ox._load(CKPT)
+            ox._qctx7_net(model.latent)
+            default_boost = os.path.join(HERE, 'ox_boost.pt')
+            if ox.BOOST_FILE != default_boost:
+                ox.BOOST_FILE = default_boost
+                ox._BOOST = None
+            ox._boost_net(dev)
+    return dev
+
+
+def _capture_model_state(key):
+    if _CODEC is None:
+        return {}
+    ox = _CODEC
+    if key == 'oxn17':
+        return {'CTX10': ox._CTX10}
+    if key in ('oxn8', 'tiny', 'tiny2'):
+        state = {'CTX7': ox._CTX7, 'QCTX7': ox._QCTX7}
+        if key in ('oxn8', 'tiny2'):
+            state.update({'BOOST': ox._BOOST, 'BOOST_FILE': ox.BOOST_FILE})
+        return state
+    return {}
+
+
+def _restore_model_state(key):
+    if key in ('pico', 'pico2', 'pico5', 'picomoe') or _CODEC is None:
+        return
+    ox = _CODEC
+    ox.CTX7_FILE = TINY2_CTX7 if key == 'tiny2' else \
+        ox.TINY_CTX7 if key == 'tiny' else ox.OXN8_CTX7
+    state = _RESIDENT_STATES[key]
+    ox._CTX7 = state.get('CTX7')
+    ox._QCTX7 = state.get('QCTX7')
+    ox._CTX10 = state.get('CTX10')
+    if 'BOOST' in state:
+        ox._BOOST = state['BOOST']
+        ox.BOOST_FILE = state['BOOST_FILE']
+
+
+def _activate_model_locked(model, stream=False):
+    global _ACTIVE_MODEL
+    key = _model_key(model)
+    if key == _ACTIVE_MODEL and not stream:
+        return key
+    required = _MODEL_FILES[key]
+    if not all(os.path.exists(path) for path in required):
+        raise RuntimeError('selected model is not trained yet')
+    if not _RESIDENT:
+        _unload_models_locked()
+    else:
+        _clear_aux_models_locked()
+    if _RESIDENT and key in _RESIDENT_STATES:
+        _restore_model_state(key)
+        _ACTIVE_MODEL = key
+        return key
+    started = time.time()
+    dev = _load_model_locked(key)
+    if _RESIDENT:
+        _RESIDENT_STATES[key] = _capture_model_state(key)
+    _ACTIVE_MODEL = key
+    print(f'model {key} loaded on {dev} in {time.time() - started:.2f}s', flush=True)
+    return key
+
+
+def _activate_model(model, stream=False):
+    with _CODEC_LOCK:
+        return _activate_model_locked(model, stream)
+
+
+def _init_models():
+    global _RESIDENT
+    files = {path for paths in _MODEL_FILES.values() for path in paths
+             if os.path.exists(path)}
+    total = sum(os.path.getsize(path) for path in files)
     try:
-        return fn(*args)
+        free = os.sysconf('SC_AVPHYS_PAGES') * os.sysconf('SC_PAGE_SIZE')
+    except (AttributeError, OSError, ValueError):
+        free = 4 * 1024 ** 3
+    _RESIDENT = total <= min(2 * 1024 ** 3, free // 8)
+    if _RESIDENT:
+        for key in _MODEL_FILES:
+            if all(os.path.exists(path) for path in _MODEL_FILES[key]):
+                _activate_model(key)
+    _activate_model('oxn8')
+    print(f'model cache: {"resident" if _RESIDENT else "exclusive"}', flush=True)
+
+
+def _codec_call(ox, fn, *args, **kwargs):
+    global _RESIDENT
+    try:
+        return fn(*args, **kwargs)
     except Exception as e:
         if 'CUDA' not in str(e) or 'memory' not in str(e) or ox._FORCE_CPU:
             raise
         ox._FORCE_CPU = True
+        _RESIDENT = False
+        _unload_models_locked()
         import torch
         torch.cuda.empty_cache()
-        return fn(*args)
+        return fn(*args, **kwargs)
 
 
+def _release_workspace():
+    torch = sys.modules.get('torch')
+    if torch is not None and torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _release_after(fn):
+    @functools.wraps(fn)
+    def wrapped(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _release_workspace()
+    return wrapped
+
+
+@_release_after
 def do_compress(fields, files):
     name, data = files['file']
     if not name.lower().endswith(IMG_EXT):
         raise Skip(name)
     adaptive = fields.get('adaptive', '1') == '1'
-    tiny = fields.get('model') == 'tiny'
+    model = fields.get('model', 'oxn8')
+    q = int(fields.get('q', '100'))
+    target_bpp = float(fields.get('target_bpp', 0) or 0)
+    if model == 'picoauto':
+        low = (target_bpp > 0 and target_bpp <= 0.25) or (target_bpp == 0 and q <= 10)
+        model = 'pico5' if low else 'pico2'
     if not os.path.exists(CANON8):
         raise RuntimeError('no oxn8_canon.npz — see README.md')
-    required = (TINY_CKPT, TINY_CTX7) if tiny else (CKPT, CTX7)
+    if model in ('tiny', 'tiny2'):
+        required = (TINY2_CKPT, TINY2_CTX7, TINY2_BOOST) if model == 'tiny2' else \
+            (TINY_CKPT, TINY_CTX7)
+    elif model.startswith('oxn17'):
+        required = (REC_CKPT, OXN13_CTX, CANON14, CANON15)
+    elif model in ('pico', 'pico2', 'pico5', 'picomoe'):
+        required = (PICO_MOE_CKPT,) if model == 'picomoe' else \
+            (PICO5_CKPT,) if model == 'pico5' else \
+            (PICO2_CKPT,) if model == 'pico2' else (PICO_CKPT,)
+    else:
+        required = (CKPT, CTX7)
     if not all(os.path.exists(p) for p in required):
         raise RuntimeError('selected model is not trained yet')
-    q = int(fields.get('q', '100'))
+    if target_bpp > 0 and model not in ('tiny', 'tiny2', 'pico', 'pico2', 'pico5', 'picomoe'):
+        raise ValueError('target bpp is available for tiny and PICO')
     ox = _codec()
     from PIL import Image, ImageOps
     rgb = ox.np.asarray(ImageOps.exif_transpose(
         Image.open(io.BytesIO(data))).convert('RGB'))
     t0 = time.time()
     with _CODEC_LOCK:
-        ox._BOOST_ON = adaptive and not tiny and fields.get('boost') == '1'
+        _activate_model_locked(model)
+        ox._BOOST_ON = adaptive and model == 'oxn8' and fields.get('boost') == '1'
         ox._VERIFY = fields.get('verify') == '1'
-        ox.CTX7_FILE = ox.TINY_CTX7 if tiny else ox.OXN8_CTX7
-        if tiny:
-            out = _codec_call(ox, ox.neuro_compress_v9, rgb, q, not adaptive)
+        ox.CTX7_FILE = TINY2_CTX7 if model == 'tiny2' else \
+            ox.TINY_CTX7 if model == 'tiny' else ox.OXN8_CTX7
+        if model in ('tiny', 'tiny2') and target_bpp > 0:
+            out = _codec_call(ox, ox.neuro_compress_tiny_v2_target_bpp, rgb,
+                              target_bpp, TINY2_CKPT if model == 'tiny2' else TINY_CKPT,
+                              TINY2_CTX7 if model == 'tiny2' else TINY_CTX7,
+                              magic=b'OXNV' if model == 'tiny2' else b'OXNT',
+                              use_boost=model == 'tiny2')
+        elif model in ('tiny', 'tiny2'):
+            out = _codec_call(ox, ox.neuro_compress_tiny_v2, rgb, q, not adaptive,
+                              TINY2_CKPT if model == 'tiny2' else TINY_CKPT,
+                              TINY2_CTX7 if model == 'tiny2' else TINY_CTX7,
+                              magic=b'OXNV' if model == 'tiny2' else b'OXNT',
+                              use_boost=model == 'tiny2')
+        elif model == 'oxn17fast':
+            out = _codec_call(ox, ox.neuro_compress_v17_fast, rgb, q, not adaptive)
+        elif model == 'oxn17':
+            out = _codec_call(ox, ox.neuro_compress_v17, rgb, q, not adaptive)
+        elif model in ('pico', 'pico2', 'pico5', 'picomoe'):
+            import oxn_pico
+            ckpt = PICO_MOE_CKPT if model == 'picomoe' else PICO5_CKPT if model == 'pico5' else \
+                PICO2_CKPT if model == 'pico2' else PICO_CKPT
+            version = 9 if model == 'picomoe' else 7 if model == 'pico5' else 6 if model == 'pico2' else 5
+            if target_bpp > 0:
+                out = oxn_pico.compress_target_bpp(
+                    rgb, target_bpp, ckpt, fields.get('verify') == '1',
+                    stream_version=version)
+            else:
+                out = oxn_pico.compress(rgb, q, ckpt, fields.get('verify') == '1',
+                                        stream_version=version)
         else:
             out = _codec_call(ox, ox.neuro_compress_v8, rgb, q, None, not adaptive)
     dt = time.time() - t0
@@ -394,18 +690,36 @@ def do_compress(fields, files):
     return out, stats
 
 
+@_release_after
 def do_decompress(fields, files):
     name, data = files['file']
     # Формат выбирает декодер по magic-байтам, включая legacy OXN1/OXN2.
     if not name.lower().endswith('.oxh') or data[:4] not in (
             b'OXN1', b'OXN2', b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7',
-            b'OXN8', b'OXN9'):
+            b'OXN8', b'OXN9', b'OXNT', b'OXNV', b'OXNA', b'OXNB', b'OXNC', b'OXND', b'OXNE',
+            b'OXNG', b'OXNH', b'OXNI', b'OXP1', b'OXP2', b'OXP3', b'OXP4', b'OXP5', b'OXP6', b'OXP7', b'OXP8', b'OXP9'):
         raise Skip(name)
     base = name[:-4]
     ox = _codec()
     t0 = time.time()
     with _CODEC_LOCK:
-        rec = _codec_call(ox, ox.neuro_decompress, data)
+        if data[:4] in (b'OXP1', b'OXP2', b'OXP3', b'OXP4', b'OXP5', b'OXP6', b'OXP7', b'OXP8', b'OXP9'):
+            model = 'picomoe' if data[:4] in (b'OXP8', b'OXP9') else \
+                'pico5' if data[:4] == b'OXP7' else 'pico2' if data[:4] == b'OXP6' else 'pico'
+            _activate_model_locked(model, stream=True)
+            import oxn_pico
+            ckpt = PICO_MOE_CKPT if model == 'picomoe' else PICO5_CKPT if model == 'pico5' else \
+                PICO2_CKPT if model == 'pico2' else PICO_CKPT
+            rec = oxn_pico.decompress(data, ckpt)
+        else:
+            model = ('tiny2' if data[:4] == b'OXNV' else
+                     'tiny' if data[:4] in (b'OXN9', b'OXNT') else
+                     'oxn17' if data[:4] in (b'OXNH', b'OXNI') else 'oxn8')
+            _activate_model_locked(model, stream=True)
+            if model == 'tiny2':
+                rec = _codec_call(ox, ox.neuro_decompress, data, TINY2_CKPT, TINY2_CTX7)
+            else:
+                rec = _codec_call(ox, ox.neuro_decompress, data)
     from PIL import Image
     buf = io.BytesIO()
     Image.fromarray(rec).save(buf, 'JPEG', quality=95, subsampling=0)
@@ -443,14 +757,30 @@ class Handler(BaseHTTPRequestHandler):
             except Exception:
                 pass
             self._send(200, json.dumps({
-                'cuda': cuda, 'gpu': gpu,
-                'tiny': os.path.exists(TINY_CKPT) and os.path.exists(TINY_CTX7)
+                'cuda': cuda, 'gpu': gpu, 'model': _ACTIVE_MODEL, 'resident': _RESIDENT,
+                'tiny': os.path.exists(TINY_CKPT) and os.path.exists(TINY_CTX7),
+                'tiny2': all(os.path.exists(p) for p in (TINY2_CKPT, TINY2_CTX7, TINY2_BOOST)),
+                'oxn17': all(os.path.exists(p) for p in
+                             (REC_CKPT, OXN13_CTX, CANON14, CANON15)),
+                'pico': os.path.exists(PICO_CKPT),
+                'pico2': os.path.exists(PICO2_CKPT),
+                'pico5': os.path.exists(PICO5_CKPT),
+                'picomoe': os.path.exists(PICO_MOE_CKPT)
             }).encode(), 'application/json')
         else:
             self._send(404, b'not found')
 
     def do_POST(self):
         try:
+            if self.path == '/api/model':
+                length = int(self.headers.get('Content-Length', 0))
+                if length <= 0 or length > 4096:
+                    raise ValueError('invalid model request')
+                fields = json.loads(self.rfile.read(length))
+                key = _activate_model(fields['model'])
+                self._send(200, json.dumps({'model': key}).encode(),
+                           'application/json')
+                return
             fields, files = parse_form(self)
             if 'file' not in files:
                 raise RuntimeError('no file in request')
@@ -486,6 +816,8 @@ def main():
     if not os.path.exists(CKPT) or not os.path.exists(CTX7) or not os.path.exists(CANON8):
         print('warning: no ox_neuro.pt / ox_ctx7.pt / oxn8_canon.npz — see README.md',
               file=sys.stderr)
+    else:
+        _init_models()
     print(f'OXH UI: http://{host}:{port}')
     ThreadingHTTPServer((host, port), Handler).serve_forever()
 

@@ -2,6 +2,8 @@
 
 State date: 2026-11-22.
 
+Reproduction instructions and publication: [`PICO_REPRODUCE.md`](PICO_REPRODUCE.md).
+
 This document describes the current working PICO MoE implementation, target hardware,
 measured performance, and bottlenecks. It is intended to help generate new optimization
 ideas. This is an independent implementation of the architecture from the Apple PICO paper,

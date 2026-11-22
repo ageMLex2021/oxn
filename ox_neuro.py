@@ -7,7 +7,10 @@ z -> round(z*s)/s. One model covers the whole quality range.
 
 Entropy coding: adaptive OXN8 by default or flat OXN8 with --flat. Its integer
 hyperprior/context path, frozen tables and canonical rANS avoid cross-architecture
-entropy desynchronization. Decompression auto-detects OXN1–OXN9 by magic header.
+entropy desynchronization. Experimental OXN10/OXN11 move context inference to
+the GPU; OXN11 adds spatial one-shot sigma, OXN12/OXN13 use a 2x2 spatial grid,
+and OXN14 adds empirical canonical rANS tables. Decompression auto-detects formats
+through OXN14 by magic header.
 
 Usage:
   python3 ox_neuro.py train [--steps 40000] [--data data/train]
@@ -38,6 +41,7 @@ def load_rgb(path):
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 CKPT = os.path.join(HERE, 'ox_neuro.pt')
+REC_CKPT = os.path.join(HERE, 'ox_neuro_rec.pt')
 PATCH = 16
 DIM = 256
 DEPTH = 4
@@ -47,6 +51,7 @@ S_MIN, S_MAX = 0.35, 8.0          # диапазон скейлера (степ�
 
 sys.path.insert(0, HERE)
 from ox import rans_encode, rans_decode      # энтропийный движок OX
+import ox_data
 
 
 def q2s(q):
@@ -77,6 +82,53 @@ def highpass_mse(xr, x, sk):
     gx_r = F.conv2d(xr, sk, padding=1, groups=ch)
     gx = F.conv2d(x, sk, padding=1, groups=ch)
     return ((gx_r - gx) ** 2).mean()
+
+
+def tiling_artifact_loss(xr, x, sizes=(1, 2, 4, 8)):
+    import torch.nn.functional as F
+    xr = xr.float().clamp(0, 1)
+    x = x.float()
+    losses = []
+    for size in sizes:
+        if size > 1:
+            a, b = F.avg_pool2d(xr, size), F.avg_pool2d(x, size)
+        else:
+            a, b = xr, x
+        losses.append((a - b).abs().mean())
+    return sum(losses) / len(losses)
+
+
+def color_balance_loss(xr, x, patch=16):
+    import torch.nn.functional as F
+    xr = xr.float().clamp(0, 1)
+    return F.avg_pool2d(xr - x.float(), patch).abs().mean()
+
+
+def patch_seam_loss(xr, x, patch=16):
+    xr = xr.float().clamp(0, 1)
+    x = x.float()
+    rx = xr[:, :, :, patch - 1:-1:patch] - xr[:, :, :, patch::patch]
+    xx = x[:, :, :, patch - 1:-1:patch] - x[:, :, :, patch::patch]
+    ry = xr[:, :, patch - 1:-1:patch] - xr[:, :, patch::patch]
+    xy = x[:, :, patch - 1:-1:patch] - x[:, :, patch::patch]
+    return ((rx - xx) ** 2).mean() + ((ry - xy) ** 2).mean()
+
+
+def text_saliency(x):
+    import torch.nn.functional as F
+    gray = x.float().mean(1, keepdim=True)
+    gx = F.pad(gray[:, :, :, 1:] - gray[:, :, :, :-1], (0, 1, 0, 0)).abs()
+    gy = F.pad(gray[:, :, 1:] - gray[:, :, :-1], (0, 0, 0, 1)).abs()
+    saliency = F.avg_pool2d(gx + gy, 5, 1, 2)
+    return (saliency > 0.08).float().detach()
+
+
+def text_fidelity_loss(xr, x):
+    xr = xr.float().clamp(0, 1)
+    x = x.float()
+    mask = text_saliency(x)
+    error = (xr - x).abs().mean(1, keepdim=True)
+    return (error * mask).sum() / mask.sum().clamp_min(1)
 
 
 # ------------------------------------------------------------ модель -------
@@ -122,7 +174,8 @@ def ms_ssim(x, y, k, weights=(0.0448, 0.2856, 0.3001, 0.2363, 0.1333)):
     return v.mean()
 def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
                 shared=False, moe=0, refine=False, hyper=False, window=0,
-                se=False, hyper_width=64, hyper_c=32, pos_tokens=4096):
+                se=False, hyper_width=64, hyper_c=32, pos_tokens=4096,
+                recurrent=0, flow=0):
     import torch
     import torch.nn as nn
 
@@ -210,6 +263,44 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
             h = torch.nn.functional.gelu(self.c1(x))
             h = torch.nn.functional.gelu(self.c2(h))
             return x + self.c3(h)
+
+    class FlowHead(nn.Module):
+        def __init__(self, steps):
+            super().__init__()
+            self.steps = steps
+            self.c1 = nn.Conv2d(7, 64, 3, padding=1)
+            self.c2 = nn.Conv2d(64, 64, 3, padding=1)
+            self.c3 = nn.Conv2d(64, 3, 3, padding=1)
+            nn.init.zeros_(self.c3.weight)
+            nn.init.zeros_(self.c3.bias)
+
+        def velocity(self, x, cond, t):
+            if torch.is_tensor(t):
+                tt = t.to(device=x.device, dtype=x.dtype).expand(
+                    -1, -1, x.shape[2], x.shape[3])
+            else:
+                tt = torch.full((x.shape[0], 1, x.shape[2], x.shape[3]), t,
+                                device=x.device, dtype=x.dtype)
+            h = torch.cat((x, cond, tt), 1)
+            h = torch.nn.functional.gelu(self.c1(h))
+            h = torch.nn.functional.gelu(self.c2(h))
+            return self.c3(h)
+
+        def sample(self, cond, seed):
+            gen = torch.Generator(device=cond.device)
+            gen.manual_seed(seed)
+            noise = torch.randn(cond.shape, generator=gen, device=cond.device,
+                                dtype=cond.dtype)
+            x = cond + 0.03 * noise
+            for i in range(self.steps):
+                x = x + self.velocity(x, cond, (i + 0.5) / self.steps) / self.steps
+            return x
+
+        def forward(self, cond):
+            r0 = self.sample(cond, 17) - cond
+            r1 = self.sample(cond, 29) - cond
+            agreement = torch.exp(-20 * (r0 - r1).abs())
+            return cond + (r0 + r1) * 0.5 * agreement
 
     class MoEFFN(nn.Module):
         """FFN-смесь экспертов: роутер по [признаки токена, log s]."""
@@ -314,6 +405,9 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
                 self.se_enc = SEGate(latent)
                 self.se_dec = SEGate(latent)
             self.refine = RefineHead() if refine else None
+            self.recurrent = RefineHead() if recurrent else None
+            self.recurrent_steps = recurrent
+            self.flow = FlowHead(flow) if flow else None
             if hyper:
                 self.hyper_enc = HyperEnc()
                 self.hyper_dec = HyperDec()
@@ -388,6 +482,11 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
             out = self.unpatchify(_linc(self.to_pix, h), H, W)
             if self.refine is not None:
                 out = self.refine(out)
+            if self.recurrent is not None:
+                for _ in range(self.recurrent_steps):
+                    out = self.recurrent(out)
+            if self.flow is not None and not self.training:
+                out = self.flow(out)
             return out
 
         def forward(self, x, s):
@@ -432,6 +531,15 @@ def build_model(patch=PATCH, dim=DIM, depth=DEPTH, latent=LATENT, heads=HEADS,
                 bits = (t.abs() / (b * math.log(2)) + torch.log2(2 * b)).sum(-1)
                 bpp = bits / (3 * self.patch * self.patch)    # B x T, бит/пиксель
             xr = self.decode(zq / sm, H, W, torch.log(s))
+            if self.flow is not None and self.training:
+                cond = xr
+                noise = torch.randn_like(cond)
+                x0 = cond + 0.03 * noise
+                t = torch.rand(B, 1, 1, 1, device=x.device, dtype=x0.dtype)
+                xt = (1 - t) * x0 + t * x
+                v = self.flow.velocity(xt, cond, t)
+                self._flow_loss = ((v - (x - x0)) ** 2).mean()
+                xr = self.flow(cond)
             return xr, bpp
 
     return OxFormer()
@@ -503,20 +611,25 @@ def _forward_ctx7(model, ctx7, xb, smap, groups):
 
 
 # ------------------------------------------------------------ обучение -----
+def _training_payload(args, model, image_count):
+    return {
+        'model': model.state_dict(),
+        'arch': {'patch': PATCH, 'dim': args.dim, 'depth': args.depth,
+                 'latent': args.latent, 'heads': args.heads, 'shared': args.shared,
+                 'moe': args.moe, 'refine': args.refine, 'hyper': args.hyper,
+                 'window': args.window, 'se': args.se,
+                 'hyper_width': args.hyper_width, 'hyper_c': args.hyper_c,
+                 'pos_tokens': args.pos_tokens,
+                 'recurrent': args.recurrent, 'flow': args.flow},
+        'training': {'args': dict(vars(args)), 'image_count': image_count},
+    }
+
+
 def cmd_train(args):
     import torch
-    from PIL import Image
 
     crop_min = args.crop
-    exts = ('.png', '.jpg', '.jpeg')
-    files = sorted(f for f in os.listdir(args.data)
-                   if f.lower().endswith(exts))
-    files = [os.path.join(args.data, f) for f in files]
-    imgs = []
-    for f in files:
-        a = load_rgb(f).astype(np.float32) / 255.0
-        if a.shape[0] >= crop_min and a.shape[1] >= crop_min:
-            imgs.append(torch.from_numpy(a).permute(2, 0, 1))
+    imgs = ox_data.train_files(args.data, crop_min, args.exclude)
     print(f'train: {len(imgs)} images from {args.data}')
 
     dev = 'cuda' if torch.cuda.is_available() else 'cpu'
@@ -525,20 +638,31 @@ def cmd_train(args):
                         refine=args.refine, hyper=args.hyper,
                         window=args.window, se=args.se,
                         hyper_width=args.hyper_width, hyper_c=args.hyper_c,
-                        pos_tokens=args.pos_tokens).to(dev)
+                        pos_tokens=args.pos_tokens, recurrent=args.recurrent,
+                        flow=args.flow).to(dev)
     if args.init:
         ck = torch.load(args.init, map_location='cpu', weights_only=True)
-        model.load_state_dict(ck['model'], strict=False)
-        print(f'init from {args.init}')
+        current = model.state_dict()
+        compatible = {k: v for k, v in ck['model'].items()
+                      if k in current and current[k].shape == v.shape}
+        model.load_state_dict(compatible, strict=False)
+        print(f'init from {args.init}: {len(compatible)}/{len(current)} tensors')
     if args.freeze_enc:
         n_frozen = 0
         for name, prm in model.named_parameters():
-            if not (name.startswith(('dec', 'to_pix', 'from_lat', 'scale_emb'))):
+            if not (name.startswith(('dec', 'to_pix', 'from_lat', 'scale_emb',
+                                     'refine', 'recurrent', 'flow'))):
                 prm.requires_grad_(False)
                 n_frozen += prm.numel()
         print(f'frozen encoder parameters: {n_frozen / 1e6:.2f}M')
     gk = _gauss_kernel().to(dev)
     sk = _sobel_kernel().to(dev)
+    lp = None
+    if args.w_lpips > 0:
+        import lpips
+        lp = lpips.LPIPS(net='alex').to(dev).eval()
+        for prm in lp.parameters():
+            prm.requires_grad_(False)
     ctx7 = None
     groups7 = None
     if args.ctx7:
@@ -568,11 +692,7 @@ def cmd_train(args):
         # случайный батч кропов
         xs = []
         for _ in range(args.batch):
-            im = imgs[np.random.randint(len(imgs))]
-            _, H, W = im.shape
-            y = np.random.randint(0, H - crop + 1)
-            x = np.random.randint(0, W - crop + 1)
-            c = im[:, y:y + crop, x:x + crop]
+            c = ox_data.random_crop(imgs[np.random.randint(len(imgs))], crop)
             if np.random.rand() < 0.5:
                 c = torch.flip(c, dims=[2])
             xs.append(c)
@@ -584,7 +704,7 @@ def cmd_train(args):
             smap = torch.full((args.batch, T_), s0, device=dev)
         else:
             g = crop // PATCH
-            bs = int(np.random.choice([2, 4, 8, 16]))
+            bs = int(np.random.choice([v for v in (2, 4, 8, 16) if v <= g]))
             nb = g // bs
             fields = np.exp(np.random.uniform(math.log(S_MIN), math.log(S_MAX),
                                               size=(args.batch, nb, nb)))
@@ -599,15 +719,31 @@ def cmd_train(args):
                 xr, bpp = model(xb, smap)
             mse = torch.mean((xr - xb) ** 2)
             loss = args.w_mse * mse + (lam * bpp).mean()
+            if args.w_flow > 0:
+                loss = loss + args.w_flow * model._flow_loss
             if args.w_msssim > 0:
                 # MS-SSIM считаем строго в fp32: в bf16 дисперсии/ковариации
                 # теряют точность и градиент лосса становится разрушительным
                 with torch.autocast('cuda', enabled=False):
                     loss = loss + args.w_msssim * (
                         1 - ms_ssim(xr.float().clamp(0, 1), xb.float(), gk))
+            if args.w_lpips > 0:
+                with torch.autocast('cuda', enabled=False):
+                    loss = loss + args.w_lpips * lp(
+                        xr.float().clamp(0, 1) * 2 - 1, xb.float() * 2 - 1).mean()
             if args.w_hp > 0:
                 loss = loss + args.w_hp * highpass_mse(
                     xr.float().clamp(0, 1), xb.float(), sk)
+            with torch.autocast('cuda', enabled=False):
+                if args.w_tal > 0:
+                    loss = loss + args.w_tal * tiling_artifact_loss(
+                        xr, xb, sizes=(4, 16, 64))
+                if args.w_color > 0:
+                    loss = loss + args.w_color * color_balance_loss(xr, xb, PATCH)
+                if args.w_seam > 0:
+                    loss = loss + args.w_seam * patch_seam_loss(xr, xb, PATCH)
+                if args.w_text > 0:
+                    loss = loss + args.w_text * text_fidelity_loss(xr, xb)
         opt.zero_grad(set_to_none=True)
         loss.backward()
         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
@@ -620,29 +756,12 @@ def cmd_train(args):
                   f'bpp~{bpp.mean().item():.3f}  '
                   f's~{smap.mean().item():.2f}  ({time.time() - t0:.0f} с)')
         if step % 5000 == 0:
-            torch.save({'model': model.state_dict(),
-                        'arch': {'patch': PATCH, 'dim': args.dim,
-                                 'depth': args.depth, 'latent': args.latent,
-                                 'heads': args.heads, 'shared': args.shared,
-                                 'moe': args.moe, 'refine': args.refine,
-                                 'hyper': args.hyper, 'window': args.window,
-                                 'se': args.se, 'hyper_width': args.hyper_width,
-                                 'hyper_c': args.hyper_c,
-                                 'pos_tokens': args.pos_tokens}},
-                        args.out + '.part')
+            torch.save(_training_payload(args, model, len(imgs)), args.out + '.part')
             if ctx7 is not None:
                 torch.save({'state': ctx7.state_dict(), 'latent': args.latent,
                             'hidden': ctx7.net[0].out_channels,
                             'groups': groups7}, args.ctx_file + '.part')
-    torch.save({'model': model.state_dict(),
-                'arch': {'patch': PATCH, 'dim': args.dim, 'depth': args.depth,
-                         'latent': args.latent, 'heads': args.heads,
-                         'shared': args.shared, 'moe': args.moe,
-                         'refine': args.refine, 'hyper': args.hyper,
-                         'window': args.window, 'se': args.se,
-                         'hyper_width': args.hyper_width,
-                         'hyper_c': args.hyper_c,
-                         'pos_tokens': args.pos_tokens}}, args.out)
+    torch.save(_training_payload(args, model, len(imgs)), args.out)
     if ctx7 is not None:
         torch.save({'state': ctx7.state_dict(), 'latent': args.latent,
                     'hidden': ctx7.net[0].out_channels,
@@ -705,6 +824,7 @@ def _decode_autocast(dev):
 
 _FORCE_CPU = False     # после CUDA OOM переключаемся на CPU насовсем
 _VERIFY = False        # самопроверка энтропийного потока после сжатия (--verify)
+_RANS_STATS = None
 _MODEL_CACHE = {}
 
 
@@ -729,6 +849,8 @@ def _load(path=None):
     arch.setdefault('hyper_width', 64)
     arch.setdefault('hyper_c', 32)
     arch.setdefault('pos_tokens', 4096)
+    arch.setdefault('recurrent', 0)
+    arch.setdefault('flow', 0)
     model = build_model(**arch)
     model.load_state_dict(ck['model'], strict=False)  # старые чекпоинты без scale_emb
     model.__dict__['_ckpt_path'] = path
@@ -785,7 +907,11 @@ def _decode_channels(body, C, T_):
 RES_RANGE = 256                     # остаток зажат в [-256, 255]
 LOG_B_MIN, LOG_B_STEP, N_BUCK = -4.5, 0.5, 24
 CANON8_FILE = os.path.join(HERE, 'oxn8_canon.npz')
+CANON14_FILE = os.path.join(HERE, 'oxn14_canon.npz')
+CANON15_FILE = os.path.join(HERE, 'oxn15_canon.npz')
 _CANON8 = None
+_CANON14 = None
+_CANON15 = None
 RT, RSCALE, RL = 4096, 12, 1 << 23
 
 
@@ -803,6 +929,38 @@ def _canon8():
             raise RuntimeError('invalid OXN8 canonical tables')
     return _CANON8
 
+
+def _canon14():
+    global _CANON14
+    if _CANON14 is None:
+        if not os.path.exists(CANON14_FILE):
+            raise RuntimeError(f'no OXN14 canonical tables: {CANON14_FILE}')
+        with np.load(CANON14_FILE, allow_pickle=False) as ck:
+            if int(ck['version'][0]) != 1:
+                raise RuntimeError('unsupported OXN14 canonical table version')
+            tables = ck['tables'].copy()
+        if tables.shape != (N_BUCK, 513) or np.any(tables[:, 0] != 0) \
+                or np.any(tables[:, -1] != RT) or np.any(np.diff(tables) < 0):
+            raise RuntimeError('invalid OXN14 canonical tables')
+        _CANON14 = {'tables': tables}
+    return _CANON14
+
+
+def _canon15():
+    global _CANON15
+    if _CANON15 is None:
+        if not os.path.exists(CANON15_FILE):
+            raise RuntimeError(f'no OXN15 canonical tables: {CANON15_FILE}')
+        with np.load(CANON15_FILE, allow_pickle=False) as ck:
+            if int(ck['version'][0]) != 1:
+                raise RuntimeError('unsupported OXN15 canonical table version')
+            tables = ck['tables'].copy()
+        if tables.shape != (2 * N_BUCK, 513) or np.any(tables[:, 0] != 0) \
+                or np.any(tables[:, -1] != RT) or np.any(np.diff(tables) < 0):
+            raise RuntimeError('invalid OXN15 canonical tables')
+        _CANON15 = {'tables': tables}
+    return _CANON15
+
 # Ускорение: параметрический rANS через C-бинарник ox (с fallback на Python)
 OX_BIN = os.path.join(HERE, 'ox')
 _PRANS_TABLES = None
@@ -814,8 +972,13 @@ _PRANS_NATIVE_LEGACY = False
 def _prans_tables(legacy=True):
     global _PRANS_TABLES, _PRANS_LEGACY
     if _PRANS_TABLES is None:
-        _PRANS_TABLES = np.zeros((4 * N_BUCK, 513), dtype='<u4')
-        _PRANS_TABLES[2 * N_BUCK:] = _canon8()['tables']
+        ntabs = 7 * N_BUCK if os.path.exists(CANON15_FILE) else 5 * N_BUCK
+        _PRANS_TABLES = np.zeros((ntabs, 513), dtype='<u4')
+        _PRANS_TABLES[2 * N_BUCK:4 * N_BUCK] = _canon8()['tables']
+        if os.path.exists(CANON14_FILE):
+            _PRANS_TABLES[4 * N_BUCK:5 * N_BUCK] = _canon14()['tables']
+        if os.path.exists(CANON15_FILE):
+            _PRANS_TABLES[5 * N_BUCK:] = _canon15()['tables']
     if legacy and not _PRANS_LEGACY:
         _PRANS_TABLES[:2 * N_BUCK] = np.stack(
             [_lap_table(i) for i in range(N_BUCK)]
@@ -866,13 +1029,11 @@ def _prans_native(legacy=False):
 
 
 def _prans_tables_file(td):
-    """Все бакет-таблицы в бинарник: [u32 K][K x 513 x u32 cum LE].
-    0..23 — legacy Лаплас, 24..47 — legacy Гаусс; 48..95 — такие же
-    распределения из замороженного канона OXN8."""
+    """Все бакет-таблицы в бинарник: [u32 K][K x 513 x u32 cum LE]."""
     tabs = _prans_tables()
     path = os.path.join(td, 'tables.bin')
     with open(path, 'wb') as f:
-        f.write(struct.pack('<I', 4 * N_BUCK))
+        f.write(struct.pack('<I', len(tabs)))
         f.write(tabs.tobytes())
     return path
 
@@ -1012,6 +1173,10 @@ def _table_for(bid):
         return _lap_table(bid)
     if bid < 2 * N_BUCK:
         return _gauss_table(bid - N_BUCK)
+    if bid >= 5 * N_BUCK:
+        return _canon15()['tables'][bid - 5 * N_BUCK]
+    if bid >= 4 * N_BUCK:
+        return _canon14()['tables'][bid - 4 * N_BUCK]
     return _canon8()['tables'][bid - 2 * N_BUCK]
 
 def rans_enc_param(symbols, bids):
@@ -1632,6 +1797,12 @@ def _anchor_mask(ht, wt):
     return ((ii + jj) % 2 == 0).reshape(-1)
 
 
+def _grid4_masks(ht, wt):
+    ii, jj = np.meshgrid(np.arange(ht), np.arange(wt), indexing='ij')
+    return [((ii % 2 == di) & (jj % 2 == dj)).reshape(-1)
+            for di, dj in ((0, 0), (0, 1), (1, 0), (1, 1))]
+
+
 def _ctx_params(ctx, zg, mu, logb, logs_map, ht, wt):
     """zg: (T, C) латент с занулёнными не-якорями; mu, logb: (T, C) от
     hyperprior; logs_map: (T,) fp64 — log потокенной степени сжатия.
@@ -1953,8 +2124,13 @@ CTX7_FILE = os.path.join(HERE, 'ox_ctx7.pt')
 OXN8_CTX7 = CTX7_FILE
 TINY_CKPT = os.path.join(HERE, 'ox_neuro_tiny.pt')
 TINY_CTX7 = os.path.join(HERE, 'ox_ctx9_tiny.pt')
+OXN10_CTX = os.path.join(HERE, 'ox_ctx10.pt')
+OXN11_CTX = os.path.join(HERE, 'ox_ctx11.pt')
+OXN12_CTX = os.path.join(HERE, 'ox_ctx12.pt')
+OXN13_CTX = os.path.join(HERE, 'ox_ctx13.pt')
 CTX7_GROUPS = (6, 6, 6, 6)
 _CTX7 = None
+_CTX10 = None
 
 
 def _build_ctx7(latent, hidden=CTX_HIDDEN):
@@ -1978,6 +2154,40 @@ def _build_ctx7(latent, hidden=CTX_HIDDEN):
     return CtxNet7()
 
 
+def _build_ctx10_scale(latent, hidden=CTX_HIDDEN):
+    import torch
+    import torch.nn as nn
+
+    return nn.Sequential(
+        nn.Conv2d(latent * 2 + 1, hidden, 5, padding=2), nn.GELU(),
+        nn.Conv2d(hidden, hidden, 1), nn.GELU(),
+        nn.Conv2d(hidden, latent, 1))
+
+
+def _fake_quant(x, scale):
+    import torch
+    return x + (torch.round(x * scale) / scale - x).detach()
+
+
+def _qat_scale_forward(net, x):
+    import torch
+    import torch.nn as nn
+    import torch.nn.functional as F
+    for layer in net:
+        if isinstance(layer, nn.Conv2d):
+            w = _fake_quant(layer.weight, Q8_WSCALE)
+            b = None if layer.bias is None else _fake_quant(
+                layer.bias, Q8_FSCALE * Q8_WSCALE)
+            x = F.conv2d(x, w, b, layer.stride, layer.padding,
+                         layer.dilation, layer.groups)
+            x = _fake_quant(x, Q8_FSCALE)
+        elif isinstance(layer, nn.GELU):
+            x = _fake_quant(F.gelu(x), Q8_FSCALE)
+        else:
+            raise RuntimeError(f'QAT: unsupported scale layer {layer}')
+    return x
+
+
 def _ctx7_net(latent, path=None):
     """-> (net fp64 CPU, groups). Канон бит-точности, как у _ctx_net."""
     global _CTX7
@@ -1996,6 +2206,44 @@ def _ctx7_net(latent, path=None):
     if sum(_CTX7[2]) != latent:
         sys.exit(f'{path}: groups {_CTX7[2]} не сходятся с latent={latent}')
     return _CTX7[1], _CTX7[2]
+
+
+def _ctx10_net(latent, dev, path=None):
+    global _CTX10
+    import torch
+    path = path or OXN10_CTX
+    key = (path, latent, dev)
+    if _CTX10 is None or _CTX10[0] != key:
+        if not os.path.exists(path):
+            sys.exit(f'no OXN10 context model {path} — run trainctx --one_shot')
+        ck = torch.load(path, map_location='cpu', weights_only=True)
+        groups = tuple(int(v) for v in ck['groups'])
+        if sum(groups) != latent:
+            sys.exit(f'{path}: groups {groups} не сходятся с latent={latent}')
+        ctx = _build_ctx7(latent, int(ck.get('hidden', CTX_HIDDEN)))
+        ctx.load_state_dict(ck['state'])
+        ctx._grid4 = bool(ck.get('grid4', False))
+        offset = ck.get('sigma_offset')
+        if offset is None:
+            ctx._sigma_offset_q = None
+        else:
+            offset = offset.detach().cpu().numpy().astype(np.float64)
+            if offset.shape != (latent,):
+                sys.exit(f'{path}: invalid sigma_offset shape {offset.shape}')
+            ctx._sigma_offset_q = np.rint(
+                offset * Q8_FSCALE).astype(np.int64)
+        scale_state = ck.get('scale_state')
+        if scale_state is None:
+            ctx._scale_net = None
+            ctx.__dict__['_qscale_net'] = None
+        else:
+            scale = _build_ctx10_scale(latent, int(ck.get('hidden', CTX_HIDDEN)))
+            scale.load_state_dict(scale_state)
+            ctx._scale_net = scale.to(dev, torch.float32).eval()
+            ctx.__dict__['_qscale_net'] = _qnet_copy(scale)
+        ctx = ctx.to(dev, torch.float32).eval()
+        _CTX10 = (key, ctx, groups)
+    return _CTX10[1], _CTX10[2]
 
 
 def _group_cuts(groups):
@@ -2148,10 +2396,28 @@ def _qround_div(num, den):
     return floor + ((twice > den) | ((twice == den) & ((floor & 1) != 0)))
 
 
-def _qdequant_latent(q_lat, scales_q):
+def _qdequant_latent(q_lat, scales_q, companding=0):
+    if companding:
+        z = companding * np.sinh(q_lat / scales_q[:, None])
+        return np.clip(np.rint(z * Q8_FSCALE), -Q8_MAX, Q8_MAX).astype(np.int64)
     num = q_lat * (256 * Q8_FSCALE)
     return np.clip(_qround_div(num, scales_q[:, None]),
                    -Q8_MAX, Q8_MAX).astype(np.int64)
+
+
+def _ctx10_mu(ctx, zg_q, mu_q, logb_q, logs_q, ht, wt, dev):
+    import torch
+    C = zg_q.shape[1]
+    feats = np.concatenate([
+        zg_q.T.reshape(1, C, ht, wt),
+        mu_q.T.reshape(1, C, ht, wt),
+        logb_q.T.reshape(1, C, ht, wt),
+        logs_q.reshape(1, 1, ht, wt)], axis=1).astype(np.float32)
+    feats *= 1.0 / Q8_FSCALE
+    with torch.no_grad():
+        out = ctx(torch.from_numpy(feats).to(dev))
+    dmu = out[0].chunk(2, 0)[0]
+    return dmu.float().cpu().numpy().reshape(C, -1).T
 
 
 def _qgelu(x):
@@ -2307,9 +2573,91 @@ def _q8_gauss_buckets(lsig_q):
             ).astype(np.int32)
 
 
-def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False):
-    """OXN8: канонический integer hyperprior + channel-group context."""
+def _q14_gauss_buckets(lsig_q):
+    thresholds = _canon8()['gauss_thresholds']
+    return (4 * N_BUCK + np.searchsorted(thresholds, lsig_q, side='right')
+            ).astype(np.int32)
+
+
+def _ctx10_gauss_buckets(mu_q, logb_q, logs_q, ht, wt, dev, ctx,
+                         custom=False):
     import torch
+    offset_q = ctx._sigma_offset_q
+    if ctx._scale_net is not None:
+        C = logb_q.shape[1]
+        feats = np.concatenate([
+            mu_q.T.reshape(1, C, ht, wt),
+            logb_q.T.reshape(1, C, ht, wt),
+            logs_q.reshape(1, 1, ht, wt)], axis=1)
+        with torch.no_grad():
+            lsig = _qnet_run(ctx._qscale_net, torch.from_numpy(feats))
+        lsig_q = lsig[0].reshape(C, -1).T.numpy()
+        if offset_q is not None:
+            lsig_q += offset_q[None, :]
+        return (_q14_gauss_buckets(lsig_q) if custom
+                else _q8_gauss_buckets(lsig_q))
+    if offset_q is None:
+        return _q8_gauss_buckets(logb_q)
+    logb = logb_q.astype(np.float64) / Q8_FSCALE
+    sig = np.logaddexp(0.0, logb) + 1e-2
+    lsig_q = np.rint(np.log(sig) * Q8_FSCALE).astype(np.int64)
+    return _q8_gauss_buckets(lsig_q + offset_q[None, :])
+
+
+def _collect_rans_stats(resid, bids):
+    if _RANS_STATS is None:
+        return
+    for bucket in np.unique(bids):
+        if bucket >= 5 * N_BUCK:
+            row = bucket - 5 * N_BUCK
+        elif bucket >= 3 * N_BUCK:
+            row = bucket - 3 * N_BUCK
+        else:
+            continue
+        values = resid[bids == bucket]
+        _RANS_STATS[row] += np.bincount(values.reshape(-1), minlength=513)
+
+
+def _rans_table_cost(q, mu, bids):
+    resid = (np.clip(q - mu, -RES_RANGE, RES_RANGE - 1) + RES_RANGE).astype(
+        np.int64)
+    if np.any(bids >= 5 * N_BUCK):
+        rows = bids - 5 * N_BUCK
+        table = _canon15()['tables'].reshape(-1)
+    elif np.any(bids >= 4 * N_BUCK):
+        rows = bids - 4 * N_BUCK
+        table = _canon14()['tables'].reshape(-1)
+    else:
+        rows = bids - 2 * N_BUCK
+        table = _canon8()['tables'].reshape(-1)
+    idx = rows * 513 + resid
+    freq = table[idx + 1] - table[idx]
+    return -np.log2(np.maximum(freq, 1) / RT)
+
+
+def _gauss_table_bits(qt, mu, lsig, offset, tables, thresholds):
+    import torch
+    resid = (torch.round(mu) - qt).neg().clamp(-RES_RANGE, RES_RANGE - 1)
+    resid = (resid + RES_RANGE).to(torch.int64)
+    lsig_q = torch.round(lsig * Q8_FSCALE)
+    lsig_q = lsig_q + torch.round(offset * Q8_FSCALE).reshape(1, -1, 1, 1)
+    bids = torch.bucketize(lsig_q.contiguous(), thresholds, right=True)
+    tab = tables[bids]
+    freq = (torch.gather(tab, -1, (resid + 1).unsqueeze(-1)).squeeze(-1)
+            - torch.gather(tab, -1, resid.unsqueeze(-1)).squeeze(-1))
+    return -torch.log2(freq.clamp_min(1).float() / RT)
+
+
+def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False, _oxn10=False,
+                      _oxn10_ctx=None, _rate_refine=False, _custom_tables=False,
+                      _channel_tables=False, _rate_passes=2, _scale_candidates=0,
+                      _companding=0):
+    """OXN8/OXN10: integer hyperprior + channel-group context."""
+    import torch
+    if _companding < 0 or (_companding and _oxn10):
+        raise ValueError('companding is only supported by the Tiny OXN8 path')
+    if _companding:
+        _companding = float(np.float16(_companding))
     model, dev = _load(ckpt)
     if getattr(model, 'hyper_enc', None) is None:
         sys.exit('OXN8 требует hyper-чекпоинт (--hyper при обучении кодека)')
@@ -2329,18 +2677,19 @@ def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False):
     zf = z.float()
     T_, C = zf.shape
     zs = zf.cpu().numpy()
+    quantized = np.arcsinh(zs / _companding) if _companding else zs
     if flat:
         scales_q = np.array([round(float(np.float32(q2s(q))) * 256)], np.int64)
         smap = np.zeros(T_, np.uint8)
-        q_lat = np.round(zs * (scales_q[0] / 256.0)).astype(np.int64)
+        q_lat = np.round(quantized * (scales_q[0] / 256.0)).astype(np.int64)
     else:
         s0 = q2s(q)
         lam = TAU / (s0 * s0)
         scales_q = np.rint(np.array(LADDER) * 256).astype(np.int64)
         scales = scales_q.astype(np.float32) / 256.0
         s0_q = np.array([round(float(np.float32(s0)) * 256)], np.int64)
-        q0 = np.round(zs * (s0_q[0] / 256.0)).astype(np.int64)
-        zqd0_q = _qdequant_latent(q0, np.full(T_, s0_q[0], np.int64))
+        q0 = np.round(quantized * (s0_q[0] / 256.0)).astype(np.int64)
+        zqd0_q = _qdequant_latent(q0, np.full(T_, s0_q[0], np.int64), _companding)
         mu0r, logb0 = _hyper_rate_estimate(model, zqd0_q, ht, wt, dev)
         b0 = np.log1p(np.exp(logb0)) + 1e-2
         Dk, Rk, Qk, Ek = [], [], [], []
@@ -2349,20 +2698,26 @@ def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False):
         need = []
         for k, s in enumerate(scales):
             sf = float(s)
-            qk = np.round(zs * sf)
+            qk = np.round(quantized * sf)
             Qk.append(qk)
             Rk.append((np.abs(qk - mu0r) / b0).sum(axis=1))
             if use_boost:
                 Ek.append(((zs * sf - qk) ** 2).mean(axis=1))
             if not use_boost or k in mid:
                 need.append(k)
+        if not use_boost and _scale_candidates:
+            count = min(len(need), _scale_candidates)
+            center = min(range(len(scales)), key=lambda k: abs(scales[k] - s0))
+            first = max(0, min(len(scales) - count, center - count // 2))
+            need = list(range(first, first + count))
         per_image = max(Hp * Wp * 400, 1)
         batch = int(np.clip(_mem_budget(dev) // per_image, 1, len(need)))
         if dev != 'cuda':
             batch = 1
         for first in range(0, len(need), batch):
             ids = need[first:first + batch]
-            zb = np.stack([(Qk[k] / float(scales[k])).astype(np.float32)
+            zb = np.stack([(_companding * np.sinh(Qk[k] / float(scales[k]))
+                            if _companding else Qk[k] / float(scales[k])).astype(np.float32)
                            for k in ids])
             zt = torch.from_numpy(zb).to(dev)
             lg = torch.from_numpy(np.log(scales[ids]).astype(np.float32))[:, None]
@@ -2374,50 +2729,92 @@ def neuro_compress_v8(rgb, q=75, ckpt=None, flat=False):
         else:
             D = np.stack(Dk)
         R = np.stack(Rk)
-        choice = np.argmin(D + lam * R, axis=0).astype(np.uint8)
+        if use_boost:
+            choice = np.argmin(D + lam * R, axis=0).astype(np.uint8)
+        else:
+            local = np.argmin(D + lam * R[need], axis=0)
+            choice = np.asarray(need, dtype=np.uint8)[local]
         smap = choice
         q_lat = np.zeros_like(Qk[0], dtype=np.int64)
         for k in range(len(scales_q)):
             m = choice == k
             q_lat[m] = Qk[k][m]
-    stok_q = scales_q[smap]
     logs_q = np.rint(np.log(scales_q.astype(np.float64) / 256.0)
                      * Q8_FSCALE).astype(np.int64)
-    zqd_q = _qdequant_latent(q_lat, stok_q)
-    w, mu_q, logb_q = _qhyper_encode(model, zqd_q, ht, wt)
-    ctx, groups = _qctx7_net(C)
-    anch = _anchor_mask(ht, wt)
-    logs_map_q = logs_q[smap]
-    mu_r = _qround_shift(mu_q, Q8_FBITS)
-    bids_l = _q8_lap_buckets(logb_q)
-    qd = np.zeros((T_, C), np.int64)
-    streams = []
-    for gi, (lo, hi) in enumerate(_group_cuts(groups)):
-        for phase in (True, False):
-            pos = anch if phase else ~anch
-            if gi == 0 and phase:
-                resid = (np.clip(q_lat - mu_r, -RES_RANGE, RES_RANGE - 1)
+    refine = _rate_refine and _oxn10 and not flat
+    for rate_pass in range(_rate_passes if refine else 1):
+        refining = refine and rate_pass < _rate_passes - 1
+        if not flat:
+            smap = choice
+        q_lat = np.zeros_like(Qk[0], np.int64) if not flat else q_lat
+        if not flat:
+            for k in range(len(scales_q)):
+                m = choice == k
+                q_lat[m] = Qk[k][m]
+        stok_q = scales_q[smap]
+        zqd_q = _qdequant_latent(q_lat, stok_q, _companding)
+        w, mu_q, logb_q = _qhyper_encode(model, zqd_q, ht, wt)
+        logs_map_q = logs_q[smap]
+        if _oxn10:
+            ctx, groups = _ctx10_net(C, dev, _oxn10_ctx)
+            bids_g = _ctx10_gauss_buckets(mu_q, logb_q, logs_map_q,
+                                          ht, wt, dev, ctx, _custom_tables)
+        else:
+            ctx, groups = _qctx7_net(C)
+        anch = _anchor_mask(ht, wt)
+        phase_masks = (_grid4_masks(ht, wt)
+                       if _oxn10 and ctx._grid4 else [anch, ~anch])
+        mu_r = _qround_shift(mu_q, Q8_FBITS)
+        bids_l = _q8_lap_buckets(logb_q)
+        qd = np.zeros((T_, C), np.int64)
+        streams = []
+        Rnew = np.zeros((len(scales_q), T_), np.float64) if refining else None
+        for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+            for pi, pos in enumerate(phase_masks):
+                if gi == 0 and pi == 0:
+                    mu_ref = mu_r
+                    bids_ref = bids_l
+                else:
+                    zg_q = _qdequant_latent(qd, stok_q, _companding)
+                    if _oxn10:
+                        dmu = _ctx10_mu(ctx, zg_q, mu_q, logb_q,
+                                        logs_map_q, ht, wt, dev)
+                        mu_ref = np.rint(mu_q / Q8_FSCALE + dmu).astype(np.int64)
+                        bids_ref = bids_g + (gi + 1) * N_BUCK \
+                            if _channel_tables else bids_g
+                    else:
+                        dmu_q, lsig_q = _qctx7_params(
+                            ctx, zg_q, mu_q, logb_q, logs_map_q, ht, wt)
+                        mu_ref = _qround_shift(mu_q + dmu_q, Q8_FBITS)
+                        bids_ref = _q8_gauss_buckets(lsig_q)
+                resid = (np.clip(q_lat - mu_ref, -RES_RANGE, RES_RANGE - 1)
                          + RES_RANGE)
-                streams.append(_enc_syms(resid[pos][:, lo:hi],
-                                         bids_l[pos][:, lo:hi]))
-                mu_ref = mu_r
-            else:
-                zg_q = _qdequant_latent(qd, stok_q)
-                dmu_q, lsig_q = _qctx7_params(
-                    ctx, zg_q, mu_q, logb_q, logs_map_q, ht, wt)
-                mu_nr = _qround_shift(mu_q + dmu_q, Q8_FBITS)
-                resid = (np.clip(q_lat - mu_nr, -RES_RANGE, RES_RANGE - 1)
-                         + RES_RANGE)
-                bids = _q8_gauss_buckets(lsig_q)
-                streams.append(_enc_syms(resid[pos][:, lo:hi],
-                                         bids[pos][:, lo:hi]))
-                mu_ref = mu_nr
-            qd[pos, lo:hi] = (resid[pos][:, lo:hi] - RES_RANGE
-                              + mu_ref[pos][:, lo:hi])
+                if refining:
+                    for k in range(len(scales_q)):
+                        cost = _rans_table_cost(
+                            Qk[k][pos][:, lo:hi], mu_ref[pos][:, lo:hi],
+                            bids_ref[pos][:, lo:hi])
+                        Rnew[k][pos] += cost.sum(axis=1)
+                else:
+                    _collect_rans_stats(resid[pos][:, lo:hi],
+                                        bids_ref[pos][:, lo:hi])
+                    streams.append(_enc_syms(resid[pos][:, lo:hi],
+                                             bids_ref[pos][:, lo:hi]))
+                qd[pos, lo:hi] = (resid[pos][:, lo:hi] - RES_RANGE
+                                  + mu_ref[pos][:, lo:hi])
+        if refining:
+            choice = np.argmin(D + lam * Rnew, axis=0).astype(np.uint8)
     wblob = _encode_flat(w)
     HC = w.shape[1]
-    out = bytearray(b'OXN8')
+    magic = (b'OXNG' if _channel_tables else b'OXNE' if _custom_tables else
+             b'OXND' if ctx._grid4 and len(groups) == 2 else
+             b'OXNC' if ctx._grid4 else
+             b'OXNB' if ctx._scale_net is not None else b'OXNA') \
+        if _oxn10 else (b'OXNU' if _companding else b'OXN8')
+    out = bytearray(magic)
     out += struct.pack('<HHBBBB', H, W, p, C, int(flat), len(scales_q))
+    if _companding:
+        out += struct.pack('<e', _companding)
     for sq, lq in zip(scales_q, logs_q):
         out += struct.pack('<Hh', int(sq), int(lq))
     out += struct.pack('<B', len(groups))
@@ -2444,12 +2841,125 @@ def neuro_compress_v9(rgb, q=75, flat=False):
     return b'OXN9' + blob[4:]
 
 
+def neuro_compress_tiny_v2(rgb, q=75, flat=False, ckpt=None, ctx_file=None,
+                           candidate_count=0, magic=b'OXNT', use_boost=False):
+    global CTX7_FILE, _BOOST_ON
+    if magic not in (b'OXNT', b'OXNV'):
+        raise ValueError('Tiny stream magic must be OXNT or OXNV')
+    ckpt = ckpt or TINY_CKPT
+    ctx_file = ctx_file or TINY_CTX7
+    CTX7_FILE = ctx_file
+    old_boost = _BOOST_ON
+    _BOOST_ON = use_boost
+    try:
+        blob = neuro_compress_v8(rgb, q, ckpt, flat,
+                                 _scale_candidates=candidate_count)
+    finally:
+        _BOOST_ON = old_boost
+    return magic + blob[4:]
+
+
+def neuro_compress_tiny_companding(rgb, q=75, a=0.1, ckpt=None, ctx_file=None):
+    global CTX7_FILE, _BOOST_ON
+    if a <= 0:
+        raise ValueError('companding parameter must be positive')
+    ckpt = ckpt or TINY_CKPT
+    ctx_file = ctx_file or TINY_CTX7
+    CTX7_FILE = ctx_file
+    old_boost = _BOOST_ON
+    _BOOST_ON = False
+    try:
+        return neuro_compress_v8(rgb, q, ckpt, False, _companding=a)
+    finally:
+        _BOOST_ON = old_boost
+
+
+def neuro_compress_tiny_v2_target_bpp(rgb, target_bpp, ckpt=None, ctx_file=None,
+                                      passes=10, magic=b'OXNT', use_boost=False):
+    if target_bpp <= 0:
+        raise ValueError('target bpp must be positive')
+    best = None
+    lo, hi = 1.0, 100.0
+    for _ in range(passes):
+        q = (lo + hi) / 2
+        blob = neuro_compress_tiny_v2(rgb, q, False, ckpt, ctx_file, magic=magic,
+                                      use_boost=use_boost)
+        bpp = len(blob) * 8 / (rgb.shape[0] * rgb.shape[1])
+        error = abs(bpp - target_bpp)
+        if best is None or error < best[0]:
+            best = error, blob
+        if bpp < target_bpp:
+            lo = q
+        else:
+            hi = q
+    return best[1]
+
+
+def neuro_compress_v10(rgb, q=75, flat=False, ckpt=None):
+    return neuro_compress_v8(rgb, q, ckpt, flat, _oxn10=True)
+
+
+def neuro_compress_v11(rgb, q=75, flat=False, ckpt=None):
+    return neuro_compress_v8(rgb, q, ckpt, flat, _oxn10=True,
+                             _oxn10_ctx=OXN11_CTX)
+
+
+def neuro_compress_v12(rgb, q=75, flat=False, ckpt=None):
+    return neuro_compress_v8(rgb, q, ckpt, flat, _oxn10=True,
+                             _oxn10_ctx=OXN12_CTX)
+
+
+def neuro_compress_v13(rgb, q=75, flat=False, ckpt=None):
+    return neuro_compress_v8(rgb, q, ckpt, flat, _oxn10=True,
+                             _oxn10_ctx=OXN13_CTX, _rate_refine=q < 100)
+
+
+def neuro_compress_v14(rgb, q=75, flat=False, ckpt=None):
+    return neuro_compress_v8(rgb, q, ckpt, flat, _oxn10=True,
+                             _oxn10_ctx=OXN13_CTX, _rate_refine=q < 100,
+                             _custom_tables=True)
+
+
+def neuro_compress_v15(rgb, q=75, flat=False, ckpt=None):
+    return neuro_compress_v8(rgb, q, ckpt, flat, _oxn10=True,
+                             _oxn10_ctx=OXN13_CTX, _rate_refine=q < 100,
+                             _custom_tables=True, _channel_tables=True)
+
+
+def neuro_compress_v16(rgb, q=75, flat=False, ckpt=None):
+    candidates = (neuro_compress_v14(rgb, q, flat, ckpt),
+                  neuro_compress_v15(rgb, q, flat, ckpt))
+    return min(candidates, key=len)
+
+
+def neuro_compress_v17_fast(rgb, q=75, flat=False, ckpt=None):
+    blob = neuro_compress_v8(rgb, q, ckpt or REC_CKPT, flat, _oxn10=True,
+                             _oxn10_ctx=OXN13_CTX, _rate_refine=q < 100,
+                             _custom_tables=True, _rate_passes=8)
+    return b'OXNH' + blob[4:]
+
+
+def neuro_compress_v17(rgb, q=75, flat=False, ckpt=None):
+    blob = neuro_compress_v16(rgb, q, flat, ckpt or REC_CKPT)
+    if blob[:4] == b'OXNE':
+        return b'OXNH' + blob[4:]
+    if blob[:4] == b'OXNG':
+        return b'OXNI' + blob[4:]
+    raise RuntimeError('unexpected OXN16 stream')
+
+
 def _neuro_decompress_v8(blob, ckpt):
     import torch
     H, W, p, C, flat, K = struct.unpack('<HHBBBB', blob[4:12])
     if flat not in (0, 1):
         raise RuntimeError('corrupt OXN8: invalid rate mode')
     pos = 12
+    companding = 0.0
+    if blob[:4] == b'OXNU':
+        (companding,) = struct.unpack('<e', blob[pos:pos + 2])
+        pos += 2
+        if companding <= 0:
+            raise RuntimeError('corrupt OXNU: invalid companding')
     scales_q = np.empty(K, np.int64)
     logs_q = np.empty(K, np.int64)
     for k in range(K):
@@ -2498,7 +3008,7 @@ def _neuro_decompress_v8(blob, ckpt):
                                   bids_l[posm][:, lo:hi])
                 mu_ref = mu_r
             else:
-                zg_q = _qdequant_latent(qd, stok_q)
+                zg_q = _qdequant_latent(qd, stok_q, companding)
                 dmu_q, lsig_q = _qctx7_params(
                     ctx, zg_q, mu_q, logb_q, logs_map_q, ht, wt)
                 mu_nr = _qround_shift(mu_q + dmu_q, Q8_FBITS)
@@ -2511,6 +3021,99 @@ def _neuro_decompress_v8(blob, ckpt):
                                - RES_RANGE + mu_ref[posm][:, lo:hi])
     if pos != len(blob):
         raise RuntimeError(f'corrupt OXN8: trailing bytes ({len(blob) - pos})')
+    scales = scales_q.astype(np.float32) / 256.0
+    stok = scales[smap]
+    normalized = qd / stok[:, None]
+    zq = companding * np.sinh(normalized) if companding else normalized
+    z = torch.from_numpy(zq.astype(np.float32))[None].to(dev)
+    logs = logs_q[smap].astype(np.float32) / Q8_FSCALE
+    lg = torch.from_numpy(logs)[None].to(dev)
+    xr = _run_decode(model, z, Hp, Wp, lg, dev)
+    return np.clip(xr[:H, :W] * 255.0 + 0.5, 0, 255).astype(np.uint8)
+
+
+def _neuro_decompress_v10(blob, ckpt):
+    import torch
+    H, W, p, C, flat, K = struct.unpack('<HHBBBB', blob[4:12])
+    if flat not in (0, 1):
+        raise RuntimeError('corrupt OXN10: invalid rate mode')
+    pos = 12
+    scales_q = np.empty(K, np.int64)
+    logs_q = np.empty(K, np.int64)
+    for k in range(K):
+        scales_q[k], logs_q[k] = struct.unpack('<Hh', blob[pos:pos + 4])
+        pos += 4
+    if K == 0 or np.any(scales_q <= 0):
+        raise RuntimeError('corrupt OXN10: invalid scales')
+    (G,) = struct.unpack('<B', blob[pos:pos + 1]); pos += 1
+    groups = tuple(struct.unpack(f'<{G}B', blob[pos:pos + G])); pos += G
+    (HC,) = struct.unpack('<H', blob[pos:pos + 2]); pos += 2
+    model, dev = _load(ckpt)
+    ctx_path = (OXN13_CTX if blob[:4] in (b'OXND', b'OXNE', b'OXNG',
+                                           b'OXNH', b'OXNI') else
+                OXN12_CTX if blob[:4] == b'OXNC' else
+                OXN11_CTX if blob[:4] == b'OXNB' else OXN10_CTX)
+    ctx, ck_groups = _ctx10_net(C, dev, ctx_path)
+    if ck_groups != groups:
+        sys.exit(f'{ctx_path}: groups {ck_groups}, в файле {groups}')
+    Hp = (H + p - 1) // p * p
+    Wp = (W + p - 1) // p * p
+    ht, wt = Hp // p, Wp // p
+    T_ = ht * wt
+    ht4, wt4 = (ht + 3) // 4, (wt + 3) // 4
+    (wlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+    w = _decode_flat(blob[pos:pos + wlen], ht4 * wt4 * HC).reshape(ht4 * wt4, HC)
+    pos += wlen
+    if flat:
+        if K != 1:
+            raise RuntimeError('corrupt OXN10: flat mode requires one scale')
+        smap = np.zeros(T_, np.uint8)
+    else:
+        (mlen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+        smap = np.frombuffer(rans_decode(blob[pos:pos + mlen]), np.uint8)
+        pos += mlen
+        if smap.shape[0] != T_ or np.any(smap >= K):
+            raise RuntimeError('corrupt OXN10: invalid scale map')
+    stok_q = scales_q[smap]
+    mu_q, logb_q = _qhyper_decode(model, w, ht, wt)
+    anch = _anchor_mask(ht, wt)
+    phase_masks = _grid4_masks(ht, wt) if ctx._grid4 else [anch, ~anch]
+    logs_map_q = logs_q[smap]
+    mu_r = _qround_shift(mu_q, Q8_FBITS)
+    bids_l = _q8_lap_buckets(logb_q)
+    bids_g = _ctx10_gauss_buckets(mu_q, logb_q, logs_map_q,
+                                  ht, wt, dev, ctx,
+                                  blob[:4] in (b'OXNE', b'OXNG', b'OXNH', b'OXNI'))
+    residuals = []
+    for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+        for pi, posm in enumerate(phase_masks):
+            (slen,) = struct.unpack('<I', blob[pos:pos + 4]); pos += 4
+            if gi == 0 and pi == 0:
+                bids = bids_l
+            elif blob[:4] in (b'OXNG', b'OXNI'):
+                bids = bids_g + (gi + 1) * N_BUCK
+            else:
+                bids = bids_g
+            residuals.append(_dec_syms(blob[pos:pos + slen],
+                                       bids[posm][:, lo:hi]))
+            pos += slen
+    if pos != len(blob):
+        raise RuntimeError(f'corrupt OXN10: trailing bytes ({len(blob) - pos})')
+    qd = np.zeros((T_, C), np.int64)
+    ri = 0
+    for gi, (lo, hi) in enumerate(_group_cuts(groups)):
+        for pi, posm in enumerate(phase_masks):
+            resid = residuals[ri]
+            ri += 1
+            if gi == 0 and pi == 0:
+                mu_ref = mu_r
+            else:
+                zg_q = _qdequant_latent(qd, stok_q)
+                dmu = _ctx10_mu(ctx, zg_q, mu_q, logb_q,
+                                logs_map_q, ht, wt, dev)
+                mu_ref = np.rint(mu_q / Q8_FSCALE + dmu).astype(np.int64)
+            qd[posm, lo:hi] = (resid.reshape(int(posm.sum()), hi - lo)
+                               - RES_RANGE + mu_ref[posm][:, lo:hi])
     scales = scales_q.astype(np.float32) / 256.0
     stok = scales[smap]
     zq = qd / stok[:, None]
@@ -2538,19 +3141,51 @@ def cmd_trainctx(args):
     anch_np = _anchor_mask(g, g)
     anch = torch.from_numpy(anch_np).to(dev)
     nanch = torch.from_numpy(~anch_np).to(dev)
+    if args.grid4:
+        train_masks = [torch.from_numpy(m).to(dev) for m in _grid4_masks(g, g)]
+    else:
+        train_masks = [anch, nanch]
     groups = None
     if args.groups:
         groups = tuple(int(v) for v in args.groups.split(','))
         if sum(groups) != C:
             sys.exit(f'--groups {groups} не сходятся с latent={C}')
         ctx = _build_ctx7(C, args.ctx_hidden).to(dev)
-        out_file = args.ctx_file
+        out_file = args.ctx_out or (OXN10_CTX if args.one_shot else args.ctx_file)
     else:
         ctx = _build_ctx(C, args.ctx_hidden).to(dev)
-        out_file = CTX_FILE
+        out_file = args.ctx_out or CTX_FILE
+    sigma_offset = None
+    scale_net = None
+    if args.one_shot:
+        if not args.groups:
+            sys.exit('--one_shot requires --groups')
+        sigma_offset = torch.nn.Parameter(torch.zeros(C, device=dev))
+    if args.scale_net:
+        if not args.one_shot:
+            sys.exit('--scale_net requires --one_shot')
+        scale_net = _build_ctx10_scale(C, args.ctx_hidden).to(dev)
+    if args.table_loss and scale_net is None:
+        sys.exit('--table_loss requires --scale_net')
+    if args.qat and scale_net is None:
+        sys.exit('--qat requires --scale_net')
+    if args.sigma_only:
+        if sigma_offset is None:
+            sys.exit('--sigma_only requires --one_shot')
+        ctx.requires_grad_(False)
+    if args.ctx_only:
+        if scale_net is None or args.sigma_only:
+            sys.exit('--ctx_only requires --scale_net and excludes --sigma_only')
+        scale_net.requires_grad_(False)
+        sigma_offset.requires_grad_(False)
     if args.init and os.path.exists(args.init):
         ck = torch.load(args.init, map_location='cpu', weights_only=True)
         ctx.load_state_dict(ck['state'])
+        if sigma_offset is not None and ck.get('sigma_offset') is not None:
+            with torch.no_grad():
+                sigma_offset.copy_(ck['sigma_offset'].to(dev))
+        if scale_net is not None and ck.get('scale_state') is not None:
+            scale_net.load_state_dict(ck['scale_state'])
         print(f'init ctx from {args.init}')
     n_params = sum(prm.numel() for prm in ctx.parameters())
     print(f'ctx parameters: {n_params / 1e3:.0f}K, device: {dev}')
@@ -2570,13 +3205,32 @@ def cmd_trainctx(args):
             crops.append(torch.from_numpy(a[y:y + crop, x:x + crop].copy()))
     print(f'trainctx: {len(crops)} crops ({crop}px) from '
           f'{len(files)} images in {args.data}')
-    opt = torch.optim.AdamW(ctx.parameters(), lr=args.lr, weight_decay=1e-5)
+    if not 0 <= args.resume_step < args.steps:
+        sys.exit('--resume_step must be >= 0 and less than --steps')
+    params = [] if args.sigma_only else list(ctx.parameters())
+    if scale_net is not None and not args.ctx_only:
+        params += list(scale_net.parameters())
+    if sigma_offset is not None and not args.ctx_only:
+        params.append(sigma_offset)
+    opt = torch.optim.AdamW(params, lr=args.lr, weight_decay=1e-5)
+    if args.resume_step:
+        for group in opt.param_groups:
+            group['initial_lr'] = args.lr
     sched = torch.optim.lr_scheduler.CosineAnnealingLR(
-        opt, T_max=args.steps, eta_min=args.lr / 20)
+        opt, T_max=args.steps, eta_min=args.lr / 20,
+        last_epoch=args.resume_step or -1)
+    if args.table_loss:
+        canon = _canon8()
+        gauss_tables = torch.from_numpy(
+            canon['tables'][N_BUCK:].astype(np.int64)).to(dev)
+        gauss_thresholds = torch.from_numpy(
+            canon['gauss_thresholds'].astype(np.int64)).to(dev)
+    else:
+        gauss_tables = gauss_thresholds = None
     sq2 = math.sqrt(2.0)
     msel = nanch.reshape(1, 1, g, g)
     t0 = time.time()
-    for step in range(1, args.steps + 1):
+    for step in range(args.resume_step + 1, args.steps + 1):
         idx = np.random.randint(0, len(crops), size=args.batch)
         xs = []
         for i in idx:
@@ -2593,7 +3247,7 @@ def cmd_trainctx(args):
             s0 = math.exp(np.random.uniform(math.log(S_MIN), math.log(S_MAX)))
             smap = torch.full((args.batch, T_), s0, device=dev)
         else:
-            bs = int(np.random.choice([2, 4, 8, 16]))
+            bs = int(np.random.choice([v for v in (2, 4, 8, 16) if v <= g]))
             nb = g // bs
             fields = np.exp(np.random.uniform(math.log(S_MIN), math.log(S_MAX),
                                               size=(args.batch, nb, nb)))
@@ -2624,27 +3278,51 @@ def cmd_trainctx(args):
             # OXN7: проходы по группам и фазам, как при декодировании;
             # известное подставляем учительски (истинные q/s), неизвестное — 0
             qg = q_lat.transpose(1, 2).reshape(args.batch, C, g, g)
-            amap = anch.reshape(1, 1, g, g)
-            nmap = nanch.reshape(1, 1, g, g)
             logs_ch = torch.log(smap).reshape(args.batch, 1, g, g)
+            lsig_one = None
+            if scale_net is not None:
+                if args.qat:
+                    mu_s = _fake_quant(mu_h, Q8_FSCALE)
+                    logb_s = _fake_quant(logb_h, Q8_FSCALE)
+                    logs_s = _fake_quant(logs_ch, Q8_FSCALE)
+                    lsig_one = _qat_scale_forward(
+                        scale_net, torch.cat([mu_s, logb_s, logs_s], 1))
+                else:
+                    lsig_one = scale_net(torch.cat([mu_h, logb_h, logs_ch], 1))
             qd = torch.zeros_like(grid)
             loss = 0.0
             npass = 0
             for gi, (lo, hi) in enumerate(_group_cuts(groups)):
-                for phase in (True, False):
-                    pm = amap if phase else nmap
-                    if gi == 0 and phase:
+                for pi, mask in enumerate(train_masks):
+                    pm = mask.reshape(1, 1, g, g)
+                    if gi == 0 and pi == 0:
                         qd[:, lo:hi] = grid[:, lo:hi] * pm
                         continue
                     feats = torch.cat([qd, mu_h, logb_h, logs_ch], 1)
                     dmu, lsig = ctx(feats).chunk(2, 1)
                     mu = mu_h[:, lo:hi] + dmu[:, lo:hi]
-                    sig = torch.nn.functional.softplus(lsig[:, lo:hi]) + 1e-2
+                    if scale_net is not None:
+                        sig0 = (torch.nn.functional.softplus(
+                            lsig_one[:, lo:hi]) + 1e-2)
+                        sig = sig0 * torch.exp(
+                            sigma_offset[lo:hi].reshape(1, -1, 1, 1))
+                    elif args.one_shot:
+                        sig0 = (torch.nn.functional.softplus(logb_h[:, lo:hi])
+                                + 1e-2)
+                        sig = sig0 * torch.exp(
+                            sigma_offset[lo:hi].reshape(1, -1, 1, 1))
+                    else:
+                        sig = torch.nn.functional.softplus(lsig[:, lo:hi]) + 1e-2
                     qt = qg[:, lo:hi]
                     cdf = 0.5 * (1 + torch.erf(
                         (torch.stack([qt + 0.5, qt - 0.5]) - mu) / (sig * sq2)))
                     prob = (cdf[0] - cdf[1]).clamp_min(1e-9)
                     bits = -torch.log2(prob)                  # B x gc x g x g
+                    if args.table_loss:
+                        table_bits = _gauss_table_bits(
+                            qt, mu, lsig_one[:, lo:hi], sigma_offset[lo:hi],
+                            gauss_tables, gauss_thresholds)
+                        bits = bits + (table_bits - bits).detach()
                     pmf = pm.float()
                     loss = loss + (bits * pmf).sum() / (pmf.sum() * args.batch)
                     npass += 1
@@ -2653,7 +3331,7 @@ def cmd_trainctx(args):
             loss = loss / npass
         opt.zero_grad(set_to_none=True)
         loss.backward()
-        torch.nn.utils.clip_grad_norm_(ctx.parameters(), 1.0)
+        torch.nn.utils.clip_grad_norm_(params, 1.0)
         opt.step()
         sched.step()
         if step % 100 == 0 or step == 1:
@@ -2667,10 +3345,19 @@ def cmd_trainctx(args):
                   f'(s~{smap.mean().item():.2f})  ({time.time() - t0:.0f} с)')
         if step % 2000 == 0:
             torch.save({'state': ctx.state_dict(), 'latent': C,
-                        'hidden': args.ctx_hidden,
-                        'groups': groups}, out_file + '.part')
+                        'hidden': args.ctx_hidden, 'groups': groups,
+                        'step': step, 'grid4': args.grid4,
+                        'sigma_offset': None if sigma_offset is None else
+                        sigma_offset.detach().cpu(),
+                        'scale_state': None if scale_net is None else
+                        scale_net.state_dict()}, out_file + '.part')
     torch.save({'state': ctx.state_dict(), 'latent': C,
-                'hidden': args.ctx_hidden, 'groups': groups}, out_file)
+                'hidden': args.ctx_hidden, 'groups': groups, 'step': args.steps,
+                'grid4': args.grid4,
+                'sigma_offset': None if sigma_offset is None else
+                sigma_offset.detach().cpu(),
+                'scale_state': None if scale_net is None else
+                scale_net.state_dict()}, out_file)
     print(f'saved: {out_file}  ({time.time() - t0:.0f} s)')
 
 
@@ -2761,10 +3448,17 @@ def neuro_decompress(blob, ckpt=None, ctx_file=None):
     if magic == b'OXN9':
         ckpt = ckpt or TINY_CKPT
         CTX7_FILE = TINY_CTX7
+    elif magic in (b'OXNT', b'OXNU', b'OXNV'):
+        ckpt = ckpt or TINY_CKPT
+        CTX7_FILE = ctx_file or TINY_CTX7
+    elif magic in (b'OXNH', b'OXNI'):
+        ckpt = ckpt or REC_CKPT
     elif magic in (b'OXN7', b'OXN8'):
         CTX7_FILE = ctx_file or OXN8_CTX7
     # hyper-форматы требуют hyper-модель; если выбранная без неё — ищем подходящую
-    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7', b'OXN8', b'OXN9'):
+    if magic in (b'OXN3', b'OXN4', b'OXN5', b'OXN6', b'OXN7', b'OXN8',
+                 b'OXN9', b'OXNT', b'OXNU', b'OXNV', b'OXNA', b'OXNB', b'OXNC', b'OXND', b'OXNE', b'OXNG',
+                 b'OXNH', b'OXNI'):
         model, _ = _load(ckpt)
         if getattr(model, 'hyper_enc', None) is None:
             for alt in ('ox_neuro_v10.pt', 'ox_neuro_v9.pt'):
@@ -2772,7 +3466,10 @@ def neuro_decompress(blob, ckpt=None, ctx_file=None):
                 if os.path.exists(p):
                     ckpt = p
                     break
-    if magic in (b'OXN8', b'OXN9'):
+    if magic in (b'OXNA', b'OXNB', b'OXNC', b'OXND', b'OXNE', b'OXNG',
+                 b'OXNH', b'OXNI'):
+        return _neuro_decompress_v10(blob, ckpt)
+    if magic in (b'OXN8', b'OXN9', b'OXNT', b'OXNU', b'OXNV'):
         return _neuro_decompress_v8(blob, ckpt)
     if magic == b'OXN7':
         return _neuro_decompress_v7(blob, ckpt)
@@ -2860,10 +3557,14 @@ def main():
     ap.add_argument('cmd', choices=['train', 'trainctx', 'c', 'd', 'bench'])
     ap.add_argument('args', nargs='*')
     ap.add_argument('--steps', type=int, default=4000)
+    ap.add_argument('--resume_step', type=int, default=0,
+                    help='trainctx: resume LR schedule and numbering at this step')
     ap.add_argument('--batch', type=int, default=8)
     ap.add_argument('--crop', type=int, default=256)
     ap.add_argument('--lr', type=float, default=2e-4)
     ap.add_argument('--data', default=os.path.join(HERE, 'data', 'kodak'))
+    ap.add_argument('--exclude', nargs='*', default=[],
+                    help='filename substrings excluded from the training corpus')
     ap.add_argument('--q', type=int, default=75)
     ap.add_argument('--dim', type=int, default=DIM)
     ap.add_argument('--depth', type=int, default=DEPTH)
@@ -2880,6 +3581,12 @@ def main():
                     help='hyperprior: network predicts the latent distribution')
     ap.add_argument('--window', type=int, default=0,
                     help='windowed attention, N x N tokens (0 = global)')
+    ap.add_argument('--recurrent', type=int, default=0,
+                    help='shared zero-init reconstruction iterations')
+    ap.add_argument('--flow', type=int, default=0,
+                    help='conditional rectified-flow refinement steps')
+    ap.add_argument('--w_flow', type=float, default=0.0,
+                    help='flow-matching loss weight')
     ap.add_argument('--refine', action='store_true',
                     help='conv refinement head against patch seams')
     ap.add_argument('--se', action='store_true',
@@ -2891,10 +3598,20 @@ def main():
                     help='файл OXN7-контекста (train/trainctx/c/d/bench)')
     ap.add_argument('--w_hp', type=float, default=0.0,
                     help='high-pass loss weight (Sobel, sharpness)')
+    ap.add_argument('--w_tal', type=float, default=0.0,
+                    help='multi-resolution tiling artifact L1 weight')
+    ap.add_argument('--w_color', type=float, default=0.0,
+                    help='per-patch low-frequency color balance weight')
+    ap.add_argument('--w_seam', type=float, default=0.0,
+                    help='patch-boundary continuity loss weight')
+    ap.add_argument('--w_text', type=float, default=0.0,
+                    help='gradient-saliency text/detail fidelity weight')
     ap.add_argument('--init', default=None, help='checkpoint to fine-tune from')
     ap.add_argument('--w_mse', type=float, default=1000.0)
     ap.add_argument('--w_msssim', type=float, default=0.0,
                     help='MS-SSIM perceptual loss weight (0 = off)')
+    ap.add_argument('--w_lpips', type=float, default=0.0,
+                    help='LPIPS perceptual loss weight (0 = off)')
     ap.add_argument('--freeze_enc', action='store_true',
                     help='fine-tune decoder only (encoder/quantizer frozen)')
     ap.add_argument('--out', default=CKPT, help='where to save the checkpoint (train)')
@@ -2905,7 +3622,41 @@ def main():
                     help='OXN8: степень по патчам выбирает маленькая '
                          'conv-сеть (ox_boost.pt) вместо 7 прогонов декодера')
     ap.add_argument('--tiny', action='store_true',
-                    help='experimental OXN9: ox_neuro_tiny.pt + ox_ctx9_tiny.pt')
+                    help='legacy OXN9: ox_neuro_tiny.pt + ox_ctx9_tiny.pt')
+    ap.add_argument('--oxn10', action='store_true',
+                    help='experimental OXN10: one-shot scale + GPU context')
+    ap.add_argument('--oxn11', action='store_true',
+                    help='experimental OXN11: spatial one-shot sigma + GPU context')
+    ap.add_argument('--oxn12', action='store_true',
+                    help='experimental OXN12: 2x2 grid context + spatial sigma')
+    ap.add_argument('--oxn13', action='store_true',
+                    help='experimental OXN13: 2x2 grid with two channel groups')
+    ap.add_argument('--oxn14', action='store_true',
+                    help='experimental OXN14: OXN13 with empirical rANS tables')
+    ap.add_argument('--oxn15', action='store_true',
+                    help='experimental OXN15: channel-group empirical rANS tables')
+    ap.add_argument('--oxn16', action='store_true',
+                    help='experimental OXN16: smallest of OXN14/OXN15 per image')
+    ap.add_argument('--oxn17', action='store_true',
+                    help='experimental OXN17: OXN16 with recurrent decoder')
+    ap.add_argument('--oxn17_fast', action='store_true',
+                    help='OXN17 with a single OXN14 encode instead of best-of')
+    ap.add_argument('--one_shot', action='store_true',
+                    help='trainctx: train OXN10 mu with fixed hyperprior sigma')
+    ap.add_argument('--sigma_only', action='store_true',
+                    help='trainctx: optimize only OXN10 one-shot sigma')
+    ap.add_argument('--scale_net', action='store_true',
+                    help='trainctx: add spatial one-shot log-sigma network')
+    ap.add_argument('--table_loss', action='store_true',
+                    help='trainctx: straight-through loss with exact rANS table cost')
+    ap.add_argument('--qat', action='store_true',
+                    help='trainctx: Q20.12 quantization-aware scale training')
+    ap.add_argument('--grid4', action='store_true',
+                    help='trainctx: use four 2x2 spatial phases')
+    ap.add_argument('--ctx_only', action='store_true',
+                    help='trainctx: freeze one-shot sigma and train only context')
+    ap.add_argument('--ctx_out', default=None,
+                    help='trainctx: output checkpoint path')
     ap.add_argument('--verify', action='store_true',
                     help='после сжатия декодировать энтропийный поток обратно '
                          'и сверить (медленно на больших изображениях)')
@@ -2948,8 +3699,29 @@ def main():
         from PIL import Image
         rgb = load_rgb(a.args[0])
         t0 = time.time()
+        if sum((a.tiny, a.oxn10, a.oxn11, a.oxn12, a.oxn13, a.oxn14,
+                a.oxn15, a.oxn16, a.oxn17, a.oxn17_fast)) > 1:
+            ap.error('experimental model flags are mutually exclusive')
         if a.tiny:
-            blob = with_cpu_fallback(neuro_compress_v9, rgb, a.q, a.flat)
+            blob = with_cpu_fallback(neuro_compress_tiny_v2, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn17_fast:
+            blob = with_cpu_fallback(neuro_compress_v17_fast, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn17:
+            blob = with_cpu_fallback(neuro_compress_v17, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn16:
+            blob = with_cpu_fallback(neuro_compress_v16, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn15:
+            blob = with_cpu_fallback(neuro_compress_v15, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn14:
+            blob = with_cpu_fallback(neuro_compress_v14, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn13:
+            blob = with_cpu_fallback(neuro_compress_v13, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn12:
+            blob = with_cpu_fallback(neuro_compress_v12, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn11:
+            blob = with_cpu_fallback(neuro_compress_v11, rgb, a.q, a.flat, a.ckpt)
+        elif a.oxn10:
+            blob = with_cpu_fallback(neuro_compress_v10, rgb, a.q, a.flat, a.ckpt)
         else:
             blob = with_cpu_fallback(neuro_compress_v8, rgb, a.q, a.ckpt, a.flat)
         open(a.args[1], 'wb').write(blob)
